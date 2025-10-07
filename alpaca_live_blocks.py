@@ -105,66 +105,59 @@ def predict_block_return_pct(sym, dt_block_start_et):
     return 0.0
 
 # ================== RUN ONE BLOCK ==================
-def run_one_block():
-    t0 = time.time()
-    dt_start, dt_end = next_block_window()
-    print(f"=== BLOCK {dt_start.strftime('%Y-%m-%d %H:%M ET')} → {dt_end.strftime('%H:%M ET')} ===")
-    now = now_ny()
-    if now < dt_start:
-        sleep_until(dt_start)
-    else:
-        lag = (now - dt_start).total_seconds()/60
-        print(f"[INFO] launching mid-block: +{lag:.1f} min after open")
+# --- 1h block start/end anchored on the hour in ET ---
+def hour_window_after(t_et):
+    t = t_et.replace(minute=0, second=0, microsecond=0)
+    start = t if t_et.minute == 0 else (t + dt.timedelta(hours=1))
+    end   = start + dt.timedelta(hours=1)
+    return start, end
 
-    # 1) enter / size once at block start
-    symbols = [TEST_SYMBOL] if TEST_MODE else ["AAPL","MSFT","PG","AMD","JPM","XOM"]
-    entries = {}
-    for sym in symbols:
-        px = latest_price(sym); entries[sym] = px
-        pred = predict_block_return_pct(sym, dt_start)   # % for the whole block
-        # Scale to a tiny trade in TEST_MODE; otherwise leave sizing=0 when pred=0
-        qty = 1 if (TEST_MODE and sym==TEST_SYMBOL) else 0
-        if pred > 0 and not TEST_MODE:
-            qty = 1  # example: 1 share long if positive prediction
-        elif pred < 0 and not TEST_MODE:
-            qty = -1 # example: 1 share short if negative prediction
-        cur = pos_qty(sym)
-        delta = qty - cur
-        print(f"[PLAN] {sym}: px={px} pred={pred:.3f}% cur={cur} target={qty} delta={delta}")
-        if delta != 0:
-            try: market(sym, delta, "enter")
-            except Exception: traceback.print_exc()
+def run_session_3_hours(symbols):
+    """Run three consecutive 1h trades starting 'now' (aligned to next top-of-hour)."""
+    # align to next hour
+    dt_start, dt_end = hour_window_after(now_ny())
+    print(f"=== SESSION start {dt_start.strftime('%Y-%m-%d %H:%M ET')} (3x 1h blocks) ===")
 
-    # 2) monitor until end, with heartbeats and simple stop
-    last_hb = 0
-    while now_ny() < dt_end:
-        time.sleep(POLL_SECONDS)
-        if time.time() - last_hb >= HEARTBEAT_SEC:
-            print(f"[HB] {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')} watching until {dt_end.strftime('%H:%M:%S %Z')}")
-            last_hb = time.time()
+    for h in range(3):
+        # block window
+        if h > 0:
+            dt_start = dt_end
+            dt_end   = dt_start + dt.timedelta(hours=1)
 
-        # simple stop-loss demo (10% adverse unlevered) for TEST symbol
-        if TEST_MODE:
-            sym = TEST_SYMBOL
-            q = pos_qty(sym)
-            if q != 0:
-                side = 1 if q>0 else -1
-                px0 = entries.get(sym, latest_price(sym))
-                px1 = latest_price(sym)
-                pnl_pct = side*((px1/px0)-1.0)*100.0
-                if pnl_pct <= -10.0:
-                    print(f"[STOP] {sym} pnl={pnl_pct:.2f}% → flatten")
-                    flatten(sym)
+        # wait for top-of-hour if we arrived early
+        if now_ny() < dt_start:
+            sleep_until(dt_start)
 
-        if time.time() - t0 >= HARD_LIMIT_SEC:
-            print("[SAFEGUARD] hard 3h limit hit → exiting loop"); break
+        print(f"--- 1h BLOCK {h+1}/3: {dt_start.strftime('%H:%M')}→{dt_end.strftime('%H:%M')} ET ---")
 
-    # 3) flatten at block end
-    print("[EXIT] flattening all")
-    for sym in symbols:
-        try: flatten(sym)
-        except Exception: traceback.print_exc()
-    print("[DONE] block finished", utc_stamp())
+        # enter/resize once at block start
+        entries = {}
+        for sym in symbols:
+            px = latest_price(sym); entries[sym] = px
+            pred = predict_block_return_pct(sym, dt_start)   # *** now interprets NEXT 1h ***
+            # simple demo sizing: ±1 share by sign; replace with your sizing rules
+            qty = (1 if pred > 0 else (-1 if pred < 0 else 0))
+            cur = pos_qty(sym)
+            delta = qty - cur
+            print(f"[PLAN] {sym}: px={px} pred_1h={pred:.3f}% cur={cur} target={qty} delta={delta}")
+            if delta != 0:
+                market(sym, delta, "enter_1h")
+
+        # monitor until end, print heartbeats, simple stop example
+        last_hb = 0
+        while now_ny() < dt_end:
+            time.sleep(POLL_SECONDS)
+            if time.time() - last_hb >= HEARTBEAT_SEC:
+                print(f"[HB] {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')} → {dt_end.strftime('%H:%M:%S %Z')}")
+                last_hb = time.time()
+
+        # flatten this hour’s positions
+        print("[EXIT] flattening hour")
+        for sym in symbols:
+            flatten(sym)
+
+    print("[DONE] session complete.")
+
 
 # ================== ENTRY POINT ==================
 if __name__ == "__main__":
