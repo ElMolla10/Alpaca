@@ -112,38 +112,34 @@ def hour_window_after(t_et):
     end   = start + dt.timedelta(hours=1)
     return start, end
 
-def run_session_3_hours(symbols):
-    """Run three consecutive 1h trades starting 'now' (aligned to next top-of-hour)."""
-    # align to next hour
-    dt_start, dt_end = hour_window_after(now_ny())
-    print(f"=== SESSION start {dt_start.strftime('%Y-%m-%d %H:%M ET')} (3x 1h blocks) ===")
+def run_session_6_hours(symbols):
+    """Run six consecutive 1h trades from 10:00 ET to 16:00 ET."""
+    dt_start = now_ny().replace(hour=10, minute=0, second=0, microsecond=0)
+    dt_end   = dt_start + datetime.timedelta(hours=1)
 
-    for h in range(3):
-        # block window
+    print(f"=== SESSION start {dt_start.strftime('%Y-%m-%d %H:%M ET')} → 16:00 ET ===")
+
+    for h in range(6):
         if h > 0:
             dt_start = dt_end
-            dt_end   = dt_start + dt.timedelta(hours=1)
+            dt_end   = dt_start + datetime.timedelta(hours=1)
 
-        # wait for top-of-hour if we arrived early
-        if now_ny() < dt_start:
-            sleep_until(dt_start)
+        print(f"--- 1h BLOCK {h+1}/6: {dt_start.strftime('%H:%M')}→{dt_end.strftime('%H:%M')} ET ---")
 
-        print(f"--- 1h BLOCK {h+1}/3: {dt_start.strftime('%H:%M')}→{dt_end.strftime('%H:%M')} ET ---")
-
-        # enter/resize once at block start
+        # enter at block start
         entries = {}
         for sym in symbols:
-            px = latest_price(sym); entries[sym] = px
-            pred = predict_block_return_pct(sym, dt_start)   # *** now interprets NEXT 1h ***
-            # simple demo sizing: ±1 share by sign; replace with your sizing rules
-            qty = (1 if pred > 0 else (-1 if pred < 0 else 0))
+            px = latest_price(sym)
+            pred = predict_block_return_pct(sym, dt_start)   # predict next 1h
+            qty = 1 if pred > 0 else (-1 if pred < 0 else 0)
             cur = pos_qty(sym)
             delta = qty - cur
             print(f"[PLAN] {sym}: px={px} pred_1h={pred:.3f}% cur={cur} target={qty} delta={delta}")
             if delta != 0:
                 market(sym, delta, "enter_1h")
+            entries[sym] = px
 
-        # monitor until end, print heartbeats, simple stop example
+        # monitor until hour end
         last_hb = 0
         while now_ny() < dt_end:
             time.sleep(POLL_SECONDS)
@@ -151,21 +147,24 @@ def run_session_3_hours(symbols):
                 print(f"[HB] {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')} → {dt_end.strftime('%H:%M:%S %Z')}")
                 last_hb = time.time()
 
-        # flatten this hour’s positions
-        print("[EXIT] flattening hour")
+        # flatten all at end of each hour
+        print("[EXIT] flattening hour positions...")
         for sym in symbols:
             flatten(sym)
 
-    print("[DONE] session complete.")
+    print("[DONE] session complete (10→16 ET).")
+
 
 
 # ================== ENTRY POINT ==================
 if __name__ == "__main__":
     try:
-        print("[MAIN] starting", utc_stamp())
-        run_one_block()
-        print("[MAIN] exit", utc_stamp())
+        print("[MAIN] starting", utc_ts())
+        symbols = [TEST_SYMBOL] if TEST_MODE else ["AAPL","MSFT","PG","AMD","JPM","XOM"]
+        run_session_6_hours(symbols)
+        print("[MAIN] exit", utc_ts())
         sys.exit(0)
     except Exception:
         traceback.print_exc()
         sys.exit(2)
+
