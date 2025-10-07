@@ -129,14 +129,14 @@ def hour_window_after(t_et):
 def run_session_6_hours(symbols):
     """Run six consecutive 1h trades from 10:00 ET to 16:00 ET."""
     dt_start = now_ny().replace(hour=10, minute=0, second=0, microsecond=0)
-    dt_end   = dt_start + datetime.timedelta(hours=1)
+    dt_end   = dt_start + (hours=1)
 
     print(f"=== SESSION start {dt_start.strftime('%Y-%m-%d %H:%M ET')} → 16:00 ET ===")
 
     for h in range(6):
         if h > 0:
             dt_start = dt_end
-            dt_end   = dt_start + datetime.timedelta(hours=1)
+            dt_end   = dt_start + (hours=1)
 
         print(f"--- 1h BLOCK {h+1}/6: {dt_start.strftime('%H:%M')}→{dt_end.strftime('%H:%M')} ET ---")
 
