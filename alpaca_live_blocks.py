@@ -2,7 +2,13 @@
 import os, sys, time, traceback, math
 import datetime as dt
 import pytz
+from datetime import datetime, timezone
 from alpaca_trade_api import REST, TimeFrame
+
+# --- add this helper ---
+def utc_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
 
 print("=== DEBUG START ===", flush=True)
