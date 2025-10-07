@@ -4,6 +4,14 @@ import datetime as dt
 import pytz
 from alpaca_trade_api import REST, TimeFrame
 
+
+print("=== DEBUG START ===", flush=True)
+import os, sys, traceback
+print("Python version:", sys.version)
+print("Current directory:", os.getcwd())
+print("Env keys:", list(os.environ.keys()))
+print("=== END DEBUG HEADER ===", flush=True)
+
 # =================== CONFIG ===================
 TZ_NY = pytz.timezone("America/New_York")
 
