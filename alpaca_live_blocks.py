@@ -26,6 +26,16 @@ BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets
 KEY_ID   = os.environ["APCA_API_KEY_ID"]
 SECRET   = os.environ["APCA_API_SECRET_KEY"]
 api = REST(KEY_ID, SECRET, BASE_URL, api_version="v2")
+from datetime import datetime
+import pytz, sys, traceback
+TZ_NY = pytz.timezone("America/New_York")
+try:
+    acct = api.get_account()
+    print(f"[START] Account={acct.status} equity=${acct.equity} buying_power=${acct.buying_power}")
+    print(f"[START] Now ET: {datetime.now(TZ_NY).strftime('%Y-%m-%d %H:%M:%S')}")
+except Exception:
+    traceback.print_exc(); sys.exit(2)
+
 
 TZ_NY = pytz.timezone("America/New_York")
 
@@ -102,6 +112,11 @@ class Sizer:
 
 def run_one_block():
     dt_start, dt_end = next_block_start_and_end()
+    print(f"=== BLOCK {dt_start.strftime('%Y-%m-%d %H:%M ET')} → {dt_end.strftime('%H:%M ET')} ===")
+    if now_ny() > dt_start:
+    lag_min = (now_ny() - dt_start).total_seconds() / 60.0
+    print(f"[INFO] Launching mid-block (started {lag_min:.1f} minutes after block open).")
+
     # If we launched before market open and the next start is not today 10:00 ET, just exit.
     if dt_start.date() != now_ny().date():
         print("Not a trading window yet; exiting.")
@@ -129,6 +144,7 @@ def run_one_block():
 
     # Monitor stop until end
     while now_ny() < dt_end:
+        print(f"[HB] {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')} watching until {dt_end.strftime('%H:%M:%S %Z')}")
         time.sleep(POLL_SECONDS)
         for sym in TICKERS:
             q = get_position_qty(sym)
