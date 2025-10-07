@@ -1,0 +1,38 @@
+services:
+  - type: worker
+    name: alpaca-paper-xgb
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app/main.py"
+    envVars:
+      - key: APCA_API_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      - key: SYMBOLS
+        value: AAPL,MSFT,PG,AMD,JPM,XOM
+      - key: PRIMARY_H
+        value: "3"
+      - key: BAND_R
+        value: "1.10"
+      - key: EMA_HL
+        value: "8"
+      - key: DPOS_CAP
+        value: "0.10"
+      - key: LEVERAGE
+        value: "3.0"
+      - key: STOP_LOSS_PCT
+        value: "2.0"
+      - key: MAX_NOTIONAL
+        value: "5000"
+      - key: MIN_ABS_POS
+        value: "0.05"
+      - key: USE_NOTIONAL_ORDERS
+        value: "1"
+      - key: MODEL_PATH
+        value: app/model/XGboost_model.json
+      - key: FEATS_PATH
+        value: app/feat_cols.json
