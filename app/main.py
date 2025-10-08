@@ -304,33 +304,31 @@ def run_session(api):
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
-    # anchor at 10:00 ET (or next whole hour)
-    block_start = now_ny().replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-    if now_ny() > block_start:
-        t = now_ny()
-        block_start = t.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    # --- start IMMEDIATELY if we're already past session start; otherwise start at session open ---
+    t_now = now_ny()
+    if t_now.hour < SESSION_START_H:
+        # before session start → start at the session open
+        block_start = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
+    else:
+        # during session → start right now (no waiting for next hour)
+        block_start = t_now
+    block_end = block_start + dt.timedelta(hours=1)
 
     for b in range(SESSION_BLOCKS):
-        block_end = block_start + dt.timedelta(hours=1)
-
-        # wait until block_start
-        while now_ny() < block_start:
-            time.sleep(5)
-
         print(f"\n=== BLOCK {b+1}/{SESSION_BLOCKS} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
         eq = account_equity(api)
 
-        # enter/update per symbol
+        # enter/update per symbol immediately
         for sym in SYMBOLS:
             px   = latest_price(api, sym)
-            pred = predict_block_return_pct(api, sym)     # % for next 1h
+            pred = predict_block_return_pct(api, sym)  # % for next 1h
             target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
             print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
             submit_target(api, sym, target_frac, eq, px)
 
         save_state(state)
 
-        # heartbeat until end
+        # heartbeat until the end of this (now-started) hour block
         last_hb = 0
         while now_ny() < block_end:
             time.sleep(10)
@@ -342,9 +340,12 @@ def run_session(api):
         for sym in SYMBOLS:
             flatten(api, sym)
 
+        # next block = immediately the next hour from the prior end
         block_start = block_end
+        block_end = block_start + dt.timedelta(hours=1)
 
     print("[DONE] session finished.")
+
 
 # =================== ENTRY ===================
 if __name__ == "__main__":
