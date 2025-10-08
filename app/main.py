@@ -16,6 +16,7 @@ def rfc3339(dtobj: datetime) -> str:
 
 
 # =================== CONFIG / ENV ===================
+ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free tiers; 'sip' requires subscription
 TZ_NY = pytz.timezone("America/New_York")
 
 BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
@@ -41,7 +42,7 @@ USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
 
 
 # new optional aggressiveness switches
-FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"
+FORCE_TRADE   = os.environ.get("FORCE_TRADE", "0") == "0"
 FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))
 
 
@@ -86,20 +87,30 @@ def save_state(st):
 # =================== ALPACA ===================
 def latest_price(api, sym):
     try:
-        tr = api.get_latest_trade(sym)
+        tr = api.get_latest_trade(sym, feed=ALPACA_DATA_FEED)
         return float(tr.price)
-    except Exception:
-        now_utc = datetime.now(timezone.utc)
-        start_utc = now_utc - timedelta(days=30)   # or the window you need
+    except Exception as e:
+        print(f"[WARN] latest_trade {sym} feed={ALPACA_DATA_FEED} failed: {e}")
+        # Fallback: use last bar close (IEX)
+        try:
+            now_utc = datetime.now(timezone.utc)
+            start_utc = now_utc - timedelta(days=3)
+            bars = api.get_bars(
+                sym,
+                TimeFrame.Minute,
+                start=rfc3339(start_utc),
+                end=rfc3339(now_utc),
+                limit=1,
+                adjustment="raw",
+                feed=ALPACA_DATA_FEED,
+            )
+            if bars:
+                b = bars[-1]
+                return float(getattr(b, "c", np.nan))
+        except Exception as e2:
+            print(f"[ERR] latest_price fallback {sym}: {e2}")
+        return math.nan
 
-        bars = api.get_bars(
-          sym,
-          TimeFrame.Hour,
-          start=rfc3339(start_utc),
-          end=rfc3339(now_utc),
-          adjustment="raw",
-          limit=1000,
-)
 
 def account_equity(api) -> float:
     try:
@@ -223,17 +234,36 @@ def _apply_training_pipeline_live(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_recent_features(api, sym, lookback_days: int = 30):
     # pull last ~30 days of hourly bars
-    now_utc = datetime.now(timezone.utc)
-    start_utc = now_utc - timedelta(days=lookback_days)
-
-    bars = api.get_bars(
-        sym,
-        TimeFrame.Hour,
-        start=rfc3339(start_utc),
-        end=rfc3339(now_utc),
-        adjustment="raw",
-        limit=1000,
-    )
+    try:
+        bars = api.get_bars(
+            sym,
+            TimeFrame.Hour,
+            start=rfc3339(start_utc),
+            end=rfc3339(now_utc),
+            adjustment="raw",
+            limit=1000,
+            feed=ALPACA_DATA_FEED,
+        )
+    except Exception as e:
+        print(f"[WARN] {sym}: get_bars feed={ALPACA_DATA_FEED} failed: {e}")
+        if ALPACA_DATA_FEED.lower() != "iex":
+            # fallback to iex automatically
+            try:
+                bars = api.get_bars(
+                    sym,
+                    TimeFrame.Hour,
+                    start=rfc3339(start_utc),
+                    end=rfc3339(now_utc),
+                    adjustment="raw",
+                    limit=1000,
+                    feed="iex",
+                )
+                print(f"[INFO] {sym}: fell back to feed=iex")
+            except Exception as e2:
+                print(f"[ERR] {sym}: get_bars failed even with iex: {e2}")
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
 
 # =================== MODEL (Booster matching training) ===================
 booster = xgb.Booster()
