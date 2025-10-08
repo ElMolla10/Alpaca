@@ -40,6 +40,8 @@ MIN_ABS_POS       = float(os.environ.get("MIN_ABS_POS", "0.02"))  # below this �
 USE_EQUITY_SIZING = os.environ.get("USE_EQUITY_SIZING", "1") == "1"  # size from equity
 PER_SYM_GROSS_CAP = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))  # 5% of equity at |pos|=1
 MAX_NOTIONAL      = float(os.environ.get("MAX_NOTIONAL", "2000"))  # hard $ cap per symbol
+USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"  # 1 → use notional $, 0 → use share qty
+
 
 
 
@@ -138,56 +140,41 @@ def flatten(api, sym):
         pass
 
 def submit_target(api, sym, target_pos_frac, equity, px):
-    # skip if zero or NaN
+    # skip if zero/NaN or no price
     if not np.isfinite(target_pos_frac) or abs(target_pos_frac) == 0.0:
         print(f"[SKIP] {sym}: target 0.0 or NaN"); return
+    if not np.isfinite(px) or px <= 0:
+        print(f"[SKIP] {sym}: invalid price {px}"); return
 
-    # compute dynamic $ size
+    # dynamic $ size from equity and |position|
     notional = compute_dynamic_notional(equity, target_pos_frac)
     side = "buy" if target_pos_frac > 0 else "sell"
 
     try:
-        api.submit_order(
-            symbol=sym,
-            notional=round(notional, 2),
-            side=side,
-            type="market",
-            time_in_force="day"
-        )
-        print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (dynamic, |pos|={abs(target_pos_frac):.3f})")
-    except Exception as e:
-        print(f"[ORDER_ERR] {sym}: {e}")
-
-
-
-    notional = min(MAX_NOTIONAL, abs(target_pos_frac) * float(equity))
-    side = "buy" if target_pos_frac > 0 else "sell"
-
-    try:
         if USE_NOTIONAL_ORDERS:
-            # SIMPLE FRACTIONAL NOTIONAL MARKET ORDER
+            # Fractional notional market order (simple)
             api.submit_order(
                 symbol=sym,
+                side=side,
+                type="market",
+                time_in_force="day",
                 notional=round(notional, 2),
-                side=side,
-                type="market",
-                time_in_force="day"
             )
-            print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (simple)")
+            print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (dynamic, |pos|={abs(target_pos_frac):.3f})")
         else:
-            # SIMPLE WHOLE-SHARE MARKET ORDER
-            qty = max(1, int(notional // max(px, 1e-6)))
+            # Whole-share order sized from notional/price
+            qty = max(1, int(notional // px))
             api.submit_order(
                 symbol=sym,
-                qty=qty,
                 side=side,
                 type="market",
-                time_in_force="day"
+                time_in_force="day",
+                qty=qty,
             )
-            print(f"[ORDER] {sym} {side.upper()} qty {qty} (simple)")
-
+            print(f"[ORDER] {sym} {side. upper()} qty {qty} (~${qty*px:,.2f}) (dynamic, |pos|={abs(target_pos_frac):.3f})")
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
+
 
 
 # =================== LIVE FEATURE PIPELINE (identical to training) ===================
