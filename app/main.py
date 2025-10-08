@@ -23,7 +23,7 @@ SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))  # 6 blocks → 10.
 
 # Live policy params (match backtest)
 # =================== CONFIG (TUNABLE) ===================
-PRIMARY_H      = int(os.environ.get("PRIMARY_H", "3"))        # model trained per 3h block
+PRIMARY_H      = int(os.environ.get("PRIMARY_H", "1"))        # model trained per 3h block
 BAND_R         = float(os.environ.get("BAND_R", "0.8"))       # smaller = more sensitive
 EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "1"))           # 1 = no smoothing
 DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.5"))     # allow faster re-hedge
