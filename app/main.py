@@ -22,20 +22,26 @@ SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))
 SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))  # 6 blocks → 10..16
 
 # Live policy params (match backtest)
+# =================== CONFIG (TUNABLE) ===================
 PRIMARY_H      = int(os.environ.get("PRIMARY_H", "3"))        # model trained per 3h block
-BAND_R         = float(os.environ.get("BAND_R", "1.10"))      # % per 3h at |pos|=1
-EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "8"))
-DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.10"))    # per block re-hedge cap
+BAND_R         = float(os.environ.get("BAND_R", "0.8"))       # smaller = more sensitive
+EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "1"))           # 1 = no smoothing
+DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.5"))     # allow faster re-hedge
 LEVERAGE       = float(os.environ.get("LEVERAGE", "3.0"))
-STOP_LOSS_PCT  = float(os.environ.get("STOP_LOSS_PCT", "2.0"))
+STOP_LOSS_PCT  = float(os.environ.get("STOP_LOSS_PCT", "2.0"))  # unchanged
+
+# new optional aggressiveness switches
+FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"
+FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))
+
 
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
 # Order sizing
 MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "5000"))
-MIN_ABS_POS          = float(os.environ.get("MIN_ABS_POS", "0.05"))  # ignore |pos| < 5%
-USE_NOTIONAL_ORDERS  = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
+FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))  # 20% exposure floor
+FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"       # enable floor
 
 # Symbols
 TEST_MODE  = os.environ.get("TEST_MODE", "0") == "1"
@@ -244,15 +250,33 @@ def update_pos_ema(prev, new, hl):
     return alpha * new + (1.0 - alpha) * prev
 
 def target_position_from_pred(pred_pct_live, band_R, hl, sym, state):
-    s = float(pred_pct_live) / max(1e-9, band_R)    # raw scale
-    s = max(-1.0, min(1.0, s))                      # clip
+    """
+    Map live predicted block return (%) -> target position in [-1, +1].
+    Applies EMA smoothing, Δ-position cap, and optional force-min exposure.
+    """
+    # 1) raw signal -> clipped
+    s = float(pred_pct_live) / max(1e-9, band_R)   # e.g., pred 0.8%, band_R=0.8 -> s=1.0
+    s = max(-1.0, min(1.0, s))
+
+    # 2) EMA smoothing
     prev = state["pos_ema"].get(sym, 0.0)
     pos_smooth = update_pos_ema(prev, s, hl)
+
+    # 3) Δ-position cap
     delta = pos_smooth - prev
     if   delta >  DPOS_CAP: pos_smooth = prev + DPOS_CAP
     elif delta < -DPOS_CAP: pos_smooth = prev - DPOS_CAP
+
+    # 4) Optional exposure floor (ensures a trade this block)
+    if FORCE_TRADE:
+        if abs(pos_smooth) < FORCE_MIN_POS:
+            sgn = 1.0 if s >= 0.0 else -1.0   # fall back to long if s==0
+            pos_smooth = sgn * FORCE_MIN_POS
+
+    # 5) persist & return
     state["pos_ema"][sym] = pos_smooth
     return pos_smooth
+
 
 # =================== MAIN LOOP ===================
 def run_session(api):
