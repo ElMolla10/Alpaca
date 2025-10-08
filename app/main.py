@@ -118,42 +118,40 @@ def flatten(api, sym):
     except Exception:
         pass
 
-def submit_target(api, sym, target_pos_frac, eq, px):
-    if not (px > 0 and eq > 0): return
+def submit_target(api, sym, target_pos_frac, equity, px):
     if abs(target_pos_frac) < MIN_ABS_POS:
-        flatten(api, sym)
+        print(f"[SKIP] {sym}: |pos|<{MIN_ABS_POS:.3f} (tiny target)")
         return
-    notional = min(MAX_NOTIONAL_PER_SYM, eq * 0.15) * float(target_pos_frac)  # 15% per symbol cap
-    if abs(notional) < max(50.0, px):
-        print(f"[SKIP] tiny notional for {sym}: {notional:.2f}")
-        return
+
+    notional = min(MAX_NOTIONAL, abs(target_pos_frac) * float(equity))
+    side = "buy" if target_pos_frac > 0 else "sell"
+
     try:
         if USE_NOTIONAL_ORDERS:
-            side = "buy" if notional > 0 else "sell"
-            print(f"[ORDER] {sym} {side.upper()} notional ${abs(notional):.2f}")
+            # SIMPLE FRACTIONAL NOTIONAL MARKET ORDER
             api.submit_order(
-                symbol=sym, notional=abs(notional), side=side,
-                type="market", time_in_force="day",
-                order_class="bracket",
-                take_profit={"limit_price": round(px * (1 + 0.01 * max(0.5, abs(target_pos_frac))), 2)},
-                stop_loss={"stop_price": round(px * (1 - STOP_LOSS_PCT/100.0), 2)}
+                symbol=sym,
+                notional=round(notional, 2),
+                side=side,
+                type="market",
+                time_in_force="day"
             )
+            print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (simple)")
         else:
-            qty = int(abs(notional) // px)
-            if qty < 1:
-                print(f"[SKIP] qty<1 for {sym}")
-                return
-            side = "buy" if notional > 0 else "sell"
-            print(f"[ORDER] {sym} {side.upper()} qty {qty}")
+            # SIMPLE WHOLE-SHARE MARKET ORDER
+            qty = max(1, int(notional // max(px, 1e-6)))
             api.submit_order(
-                symbol=sym, qty=qty, side=side,
-                type="market", time_in_force="day",
-                order_class="bracket",
-                take_profit={"limit_price": round(px * (1 + 0.01 * max(0.5, abs(target_pos_frac))), 2)},
-                stop_loss={"stop_price": round(px * (1 - STOP_LOSS_PCT/100.0), 2)}
+                symbol=sym,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="day"
             )
+            print(f"[ORDER] {sym} {side.upper()} qty {qty} (simple)")
+
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
+
 
 # =================== LIVE FEATURE PIPELINE (identical to training) ===================
 with open(FEATS_PATH, "r") as f:
@@ -223,26 +221,19 @@ def _apply_training_pipeline_live(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna().reset_index(drop=True)
     return df
 
-def fetch_recent_features(api, sym: str) -> np.ndarray | None:
-    df = _fetch_hour_bars(api, sym)
-    if df.empty:
-        print(f"[WARN] no hourly bars for {sym}")
-        return None
-    df = _regular_hours_filter(df)
-    if len(df) < 60:
-        print(f"[WAIT] need more regular-hour bars for {sym}: have {len(df)}")
-        return None
-    df = _compute_base_indicators(df)
-    df = _apply_training_pipeline_live(df)
-    if df.empty:
-        print(f"[WAIT] no fully-formed row for {sym} after pipeline")
-        return None
-    row = df.iloc[-1]
-    for col in FEAT_COLS:
-        if col not in df.columns:
-            row[col] = 0.0
-    X = row[FEAT_COLS].astype(float).values.reshape(1, -1)
-    return X
+def fetch_recent_features(api, sym, lookback_days: int = 30):
+    # pull last ~30 days of hourly bars
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(days=lookback_days)
+
+    bars = api.get_bars(
+        sym,
+        TimeFrame.Hour,
+        start=rfc3339(start_utc),
+        end=rfc3339(now_utc),
+        adjustment="raw",
+        limit=1000,
+    )
 
 # =================== MODEL (Booster matching training) ===================
 booster = xgb.Booster()
