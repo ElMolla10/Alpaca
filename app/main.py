@@ -30,15 +30,17 @@ SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))  # 6 blocks → 10.
 # Live policy params (match backtest)
 # =================== CONFIG (TUNABLE) ===================
 PRIMARY_H      = int(os.environ.get("PRIMARY_H", "1"))        # model trained per 3h block
-BAND_R         = float(os.environ.get("BAND_R", "0.35"))       # smaller = more sensitive
-EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "1"))           # 1 = no smoothing
-DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.5"))     # allow faster re-hedge
-LEVERAGE       = float(os.environ.get("LEVERAGE", "3.0"))
-STOP_LOSS_PCT  = float(os.environ.get("STOP_LOSS_PCT", "2.0"))  # unchanged
-# --- execution controls / sizing ---
-MIN_ABS_POS = float(os.environ.get("MIN_ABS_POS", "0.01"))
-MAX_NOTIONAL = float(os.environ.get("MAX_NOTIONAL", "8000"))
-USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
+# --- dynamic sizing knobs ---
+BAND_R            = float(os.environ.get("BAND_R", "1.10"))   # % per 1h that maps to |pos|=1
+POS_EXP           = float(os.environ.get("POS_EXP", "1.5"))   # convexity: 1=linear, >1 emphasizes strong signals
+EMA_HALF_LIFE     = int(os.environ.get("EMA_HL", "8"))        # smoothing of target position
+DPOS_CAP          = float(os.environ.get("DPOS_CAP", "0.10")) # max change per block
+MAX_POS           = float(os.environ.get("MAX_POS", "0.75"))  # absolute cap on |position|
+MIN_ABS_POS       = float(os.environ.get("MIN_ABS_POS", "0.02"))  # below this → 0
+USE_EQUITY_SIZING = os.environ.get("USE_EQUITY_SIZING", "1") == "1"  # size from equity
+PER_SYM_GROSS_CAP = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))  # 5% of equity at |pos|=1
+MAX_NOTIONAL      = float(os.environ.get("MAX_NOTIONAL", "2000"))  # hard $ cap per symbol
+
 
 
 # new optional aggressiveness switches
@@ -136,9 +138,26 @@ def flatten(api, sym):
         pass
 
 def submit_target(api, sym, target_pos_frac, equity, px):
-    if abs(target_pos_frac) == 0.0:
-        print(f"[SKIP] {sym}: target 0.0 (no signal)")
-        return
+    # skip if zero or NaN
+    if not np.isfinite(target_pos_frac) or abs(target_pos_frac) == 0.0:
+        print(f"[SKIP] {sym}: target 0.0 or NaN"); return
+
+    # compute dynamic $ size
+    notional = compute_dynamic_notional(equity, target_pos_frac)
+    side = "buy" if target_pos_frac > 0 else "sell"
+
+    try:
+        api.submit_order(
+            symbol=sym,
+            notional=round(notional, 2),
+            side=side,
+            type="market",
+            time_in_force="day"
+        )
+        print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (dynamic, |pos|={abs(target_pos_frac):.3f})")
+    except Exception as e:
+        print(f"[ORDER_ERR] {sym}: {e}")
+
 
 
     notional = min(MAX_NOTIONAL, abs(target_pos_frac) * float(equity))
@@ -347,6 +366,40 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     return df
 
 
+def update_pos_ema(prev: float, target: float, half_life: int) -> float:
+    if half_life <= 1:
+        return target
+    alpha = 1.0 - 0.5 ** (1.0 / float(half_life))
+    return alpha * target + (1.0 - alpha) * prev
+
+def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
+    """
+    Convert predicted % to target raw position in [-1,1].
+    - Normalize by band_R (percent at which |pos|=1 before convexity)
+    - Apply convexity: |s|**exp (keeps sign)
+    - Clip to [-1,1]
+    """
+    s = float(pred_pct) / max(1e-12, band_R)     # normalize
+    s = max(-10.0, min(10.0, s))                 # guard
+    mag = abs(s) ** exp_
+    pos = (1.0 if s >= 0 else -1.0) * min(1.0, mag)
+    return pos
+
+def compute_dynamic_notional(equity: float, pos_frac: float) -> float:
+    """
+    $ notional from position fraction and equity, with caps.
+    - If USE_EQUITY_SIZING: equity * PER_SYM_GROSS_CAP * |pos|
+    - Else: MAX_NOTIONAL * |pos|
+    Always capped by MAX_NOTIONAL.
+    """
+    if USE_EQUITY_SIZING:
+        base = float(equity) * PER_SYM_GROSS_CAP * abs(pos_frac)
+    else:
+        base = MAX_NOTIONAL * abs(pos_frac)
+    return float(min(MAX_NOTIONAL, max(1.0, base)))  # at least $1 to avoid 0
+
+
+
 # =================== MODEL (Booster matching training) ===================
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
@@ -388,23 +441,25 @@ def update_pos_ema(prev, new, hl):
     alpha = 1.0 - 0.5 ** (1.0 / float(hl))
     return alpha * new + (1.0 - alpha) * prev
 
-def target_position_from_pred(pred_pct_live, band_R, hl, sym, state):
-    s = float(pred_pct_live) / max(1e-9, band_R)
-    s = max(-1.0, min(1.0, s))
+def target_position_from_pred(pred_pct_live: float, band_R: float, hl: int, sym: str, state: dict) -> float:
+    # map prediction → raw desired position
+    raw = map_signal_to_pos(pred_pct_live, band_R, POS_EXP)
 
+    # EMA smooth + delta cap
     prev = state["pos_ema"].get(sym, 0.0)
-    pos_smooth = update_pos_ema(prev, s, hl)
+    pos  = update_pos_ema(prev, raw, hl)
+    delta = pos - prev
+    if   delta >  DPOS_CAP: pos = prev + DPOS_CAP
+    elif delta < -DPOS_CAP: pos = prev - DPOS_CAP
 
-    delta = pos_smooth - prev
-    if   delta >  DPOS_CAP: pos_smooth = prev + DPOS_CAP
-    elif delta < -DPOS_CAP: pos_smooth = prev - DPOS_CAP
+    # global cap & tiny cutoff
+    pos = max(-MAX_POS, min(MAX_POS, pos))
+    if abs(pos) < MIN_ABS_POS:
+        pos = 0.0
 
-    if FORCE_TRADE and abs(pos_smooth) < FORCE_MIN_POS:
-        sgn = 1.0 if s >= 0.0 else -1.0
-        pos_smooth = sgn * FORCE_MIN_POS
+    state["pos_ema"][sym] = pos
+    return pos
 
-    state["pos_ema"][sym] = pos_smooth
-    return pos_smooth
 
 
 
