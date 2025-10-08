@@ -60,8 +60,9 @@ MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "8000"))
 
 # Symbols
 TEST_MODE  = os.environ.get("TEST_MODE", "0") == "1"
-SYMBOLS    = [os.environ.get("TEST_SYMBOL", "AAPL")] if TEST_MODE else \
-             os.environ.get("SYMBOLS", "AAPL","MSFT","NVDA","AMD","JPM","GS","XOM","CVX","PG","KO").split(",")
+symbols_env = os.environ.get("SYMBOLS", "AAPL,MSFT,NVDA,AMD,JPM,GS,XOM,CVX,PG,KO")
+SYMBOLS = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+print(f"[INIT] SYMBOLS={SYMBOLS}")
 
 # Model & features
 MODEL_PATH = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
