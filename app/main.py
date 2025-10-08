@@ -91,7 +91,6 @@ def latest_price(api, sym):
         return float(tr.price)
     except Exception as e:
         print(f"[WARN] latest_trade {sym} feed={ALPACA_DATA_FEED} failed: {e}")
-        # Fallback: use last bar close (IEX)
         try:
             now_utc = datetime.now(timezone.utc)
             start_utc = now_utc - timedelta(days=3)
@@ -112,6 +111,7 @@ def latest_price(api, sym):
         return math.nan
 
 
+
 def account_equity(api) -> float:
     try:
         return float(api.get_account().equity)
@@ -130,9 +130,10 @@ def flatten(api, sym):
         pass
 
 def submit_target(api, sym, target_pos_frac, equity, px):
-    if abs(target_pos_frac) < MIN_ABS_POS:
-        print(f"[SKIP] {sym}: |pos|<{MIN_ABS_POS:.3f} (tiny target)")
-        return
+    if abs(target_pos_frac) == 0.0:
+    print(f"[SKIP] {sym}: target 0.0 (no signal)")
+    return
+
 
     notional = min(MAX_NOTIONAL, abs(target_pos_frac) * float(equity))
     side = "buy" if target_pos_frac > 0 else "sell"
@@ -232,8 +233,16 @@ def _apply_training_pipeline_live(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna().reset_index(drop=True)
     return df
 
-def fetch_recent_features(api, sym, lookback_days: int = 30):
-    # pull last ~30 days of hourly bars
+def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.DataFrame:
+    """
+    Pull last ~30 days of HOURLY bars from Alpaca (IEX feed) and compute the same
+    features as training. Returns DataFrame with 'timestamp' (UTC) + FEAT_COLS.
+    """
+    # --- define window first ---
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(days=lookback_days)
+
+    # --- bars fetch with IEX feed (avoid SIP) ---
     try:
         bars = api.get_bars(
             sym,
@@ -247,7 +256,6 @@ def fetch_recent_features(api, sym, lookback_days: int = 30):
     except Exception as e:
         print(f"[WARN] {sym}: get_bars feed={ALPACA_DATA_FEED} failed: {e}")
         if ALPACA_DATA_FEED.lower() != "iex":
-            # fallback to iex automatically
             try:
                 bars = api.get_bars(
                     sym,
@@ -264,6 +272,74 @@ def fetch_recent_features(api, sym, lookback_days: int = 30):
                 return pd.DataFrame()
         else:
             return pd.DataFrame()
+
+    if not bars:
+        print(f"[WARN] {sym}: no hourly bars")
+        return pd.DataFrame()
+
+    # --- build DataFrame ---
+    rows = []
+    for b in bars:
+        ts = b.t if isinstance(b.t, datetime) else pd.to_datetime(b.t, utc=True)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        rows.append({
+            "timestamp": ts,
+            "open": float(getattr(b, "o", np.nan)),
+            "high": float(getattr(b, "h", np.nan)),
+            "low":  float(getattr(b, "l", np.nan)),
+            "close": float(getattr(b, "c", np.nan)),
+            "volume": float(getattr(b, "v", np.nan)),
+            "vwap": float(getattr(b, "vw", np.nan)) if hasattr(b, "vw") else np.nan,
+        })
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+    # --- filter to 10:00–15:59 ET (match training) ---
+    ts_et = df["timestamp"].dt.tz_convert("America/New_York")
+    df = df.loc[ts_et.dt.hour.between(10, 15)].reset_index(drop=True)
+    if df.empty:
+        print(f"[WARN] {sym}: bars after RTH filter are empty")
+        return df
+
+    # --- base features ---
+    df["price_change_pct"] = df["close"].pct_change() * 100.0
+    macd_ind = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["MACDh_12_26_9"] = macd_ind.macd_diff()
+    bb = BollingerBands(close=df["close"], window=20, window_dev=2.0)
+    df["BBM_20_2.0"] = bb.bollinger_mavg()
+
+    df["ret1h_pct"] = df["close"].pct_change().shift(-1) * 100.0
+    df["sigma20_pct"] = df["ret1h_pct"].rolling(20).std().shift(1)
+    df["sigma20_pct"] = df["sigma20_pct"].replace(0.0, np.nan)
+
+    base = ["open","high","low","close","volume","vwap",
+            "price_change_pct","MACDh_12_26_9","BBM_20_2.0"]
+    for f in base:
+        if f not in df.columns:
+            df[f] = 0.0
+        df[f] = df[f].shift(1)
+
+    for f in ["price_change_pct","MACDh_12_26_9","BBM_20_2.0"]:
+        df[f+"_lag2"] = df[f].shift(2)
+        df[f+"_lag3"] = df[f].shift(3)
+
+    df["vol20"] = df["ret1h_pct"].rolling(20).std().shift(1)
+    df["ret5"]  = df["close"].pct_change(5).shift(1) * 100.0
+
+    for f in ["price_change_pct","ret5","vol20","MACDh_12_26_9","BBM_20_2.0"]:
+        if f in df.columns:
+            df[f+"_N"] = df[f] / df["sigma20_pct"]
+
+    df = df.dropna().reset_index(drop=True)
+
+    # ensure all FEAT_COLS exist (fill missing with 0.0 to avoid crashes)
+    for c in FEAT_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    df = df[["timestamp"] + [c for c in FEAT_COLS if c in df.columns]]
+    return df
+
 
 # =================== MODEL (Booster matching training) ===================
 booster = xgb.Booster()
