@@ -247,25 +247,50 @@ def fetch_recent_features(api, sym: str) -> np.ndarray | None:
 # =================== MODEL (Booster matching training) ===================
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
+import json
+FEATS_PATH = os.environ.get("FEATS_PATH", "app/feat_cols.json")
+with open(FEATS_PATH, "r") as f:
+    FEAT_COLS = json.load(f)
+print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
 
-def predict_block_return_pct(api, sym: str) -> float:
+def predict_block_return_pct(api, sym):
     """
-    Predict % return for NEXT 1h, scaled from PRIMARY_H block as trained.
+    Returns predicted next-1h return in percent.
+    Works with XGBClassifier (probability) or XGBRegressor (direct).
+    Prints strong debug to diagnose feature flow.
     """
     try:
-        X = fetch_recent_features(api, sym)
-        if X is None:
+        df = fetch_recent_features(api, sym)  # must return a DataFrame
+        if df is None or df.empty:
+            print(f"[WARN] {sym}: no features returned")
             return 0.0
-        dmat = xgb.DMatrix(X)
-        pred_pct_primary = float(booster.predict(dmat)[0])  # % per PRIMARY_H block
-        # variance scaling 3h -> 1h
-        scale = math.sqrt(1.0 / float(PRIMARY_H))
-        pred_1h_pct = pred_pct_primary * scale
-        print(f"[PRED] {sym}: {pred_pct_primary:.3f}% per {PRIMARY_H}h → {pred_1h_pct:.3f}% per 1h")
-        return pred_1h_pct
+
+        # Ensure columns exist & align to training order
+        missing = [c for c in FEAT_COLS if c not in df.columns]
+        if missing:
+            print(f"[ERR] {sym}: missing features: {missing[:8]}{'...' if len(missing)>8 else ''}")
+            return 0.0
+
+        X = df[FEAT_COLS].astype(float).iloc[-1:].values
+        last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
+        print(f"[DBG] {sym}: feature row OK shape={X.shape} last_ts={last_ts}")
+
+        # Inference
+        if hasattr(model, "predict_proba"):
+            p_up = float(model.predict_proba(X)[0, 1])
+            pred_pct = (p_up - 0.5) * 200.0   # map prob to signed %
+            print(f"[DBG] {sym}: p_up={p_up:.3f} -> pred={pred_pct:.3f}%")
+            return pred_pct
+        else:
+            raw = float(model.predict(X)[0])
+            # If your model outputs normalized return, you’d rescale here.
+            print(f"[DBG] {sym}: reg_pred={raw:.4f} -> pred={raw:.3f}%")
+            return raw
+
     except Exception as e:
         print(f"[ERR] predict {sym}: {e}")
         return 0.0
+
 
 # =================== POSITION POLICY (continuous) ===================
 def update_pos_ema(prev, new, hl):
@@ -319,12 +344,20 @@ def run_session(api):
         eq = account_equity(api)
 
         # enter/update per symbol immediately
-        for sym in SYMBOLS:
-            px   = latest_price(api, sym)
-            pred = predict_block_return_pct(api, sym)  # % for next 1h
-            target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-            print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-            submit_target(api, sym, target_frac, eq, px)
+for sym in SYMBOLS:
+  try:
+        print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+        px   = latest_price(api, sym)
+        pred = predict_block_return_pct(api, sym)  # % for next 1h
+
+        if pred == 0.0:
+            print(f"[WARN] {sym}: prediction is 0.0 (check feature pipeline)")
+
+        target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+        print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+        submit_target(api, sym, target_frac, eq, px)
+    except Exception as e:
+        print(f"[ERR] symbol {sym}: {e}", flush=True)
 
         save_state(state)
 
