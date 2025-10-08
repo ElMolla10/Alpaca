@@ -41,6 +41,8 @@ USE_EQUITY_SIZING = os.environ.get("USE_EQUITY_SIZING", "1") == "1"  # size from
 PER_SYM_GROSS_CAP = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))  # 5% of equity at |pos|=1
 MAX_NOTIONAL      = float(os.environ.get("MAX_NOTIONAL", "2000"))  # hard $ cap per symbol
 USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"  # 1 → use notional $, 0 → use share qty
+SHORTS_ENABLED = os.environ.get("SHORTS_ENABLED", "1") == "1"  # 1=allow shorts
+
 
 
 
@@ -140,40 +142,84 @@ def flatten(api, sym):
         pass
 
 def submit_target(api, sym, target_pos_frac, equity, px):
-    # skip if zero/NaN or no price
     if not np.isfinite(target_pos_frac) or abs(target_pos_frac) == 0.0:
         print(f"[SKIP] {sym}: target 0.0 or NaN"); return
     if not np.isfinite(px) or px <= 0:
         print(f"[SKIP] {sym}: invalid price {px}"); return
 
-    # dynamic $ size from equity and |position|
-    notional = compute_dynamic_notional(equity, target_pos_frac)
-    side = "buy" if target_pos_frac > 0 else "sell"
+    tradable, fractionable, shortable, etb = asset_caps(api, sym)
+    if not tradable:
+        print(f"[SKIP] {sym}: not tradable"); return
 
-    try:
-        if USE_NOTIONAL_ORDERS:
-            # Fractional notional market order (simple)
-            api.submit_order(
+    want_short = target_pos_frac < 0
+    side = "sell" if want_short else "buy"
+
+    # dynamic size
+    notional = compute_dynamic_notional(equity, target_pos_frac)
+
+    # --- SHORT path: must use whole-share qty, and asset must be shortable ---
+    if want_short:
+        if not SHORTS_ENABLED:
+            print(f"[SKIP] {sym}: shorts disabled (SHORTS_ENABLED=0)"); return
+        if not shortable:
+            print(f"[SKIP] {sym}: not shortable per Alpaca"); return
+
+        qty = int(max(1, math.floor(notional / px)))  # whole shares only
+        try:
+            order = api.submit_order(
                 symbol=sym,
-                side=side,
-                type="market",
-                time_in_force="day",
-                notional=round(notional, 2),
-            )
-            print(f"[ORDER] {sym} {side.upper()} notional ${notional:,.2f} (dynamic, |pos|={abs(target_pos_frac):.3f})")
-        else:
-            # Whole-share order sized from notional/price
-            qty = max(1, int(notional // px))
-            api.submit_order(
-                symbol=sym,
-                side=side,
+                side="sell",
                 type="market",
                 time_in_force="day",
                 qty=qty,
             )
-            print(f"[ORDER] {sym} {side. upper()} qty {qty} (~${qty*px:,.2f}) (dynamic, |pos|={abs(target_pos_frac):.3f})")
+            est = qty * px
+            print(f"[ORDER] {sym} SELL qty {qty} (~${est:,.2f}) short "
+                  f"(|pos|={abs(target_pos_frac):.3f}) id={order.id} status={order.status}")
+            try:
+                ord_ref = api.get_order(order.id)
+                print(f"[ORDERSTAT] {sym} id={order.id} status={ord_ref.status} "
+                      f"filled={ord_ref.filled_qty} avg_price={getattr(ord_ref, 'filled_avg_price', None)}")
+            except Exception as e2:
+                print(f"[ORDERSTAT_ERR] {sym} {order.id}: {e2}")
+        except Exception as e:
+            print(f"[ORDER_ERR] {sym}: {e}")
+        return
+
+    # --- LONG path: can use fractional notional if allowed ---
+    try:
+        if USE_NOTIONAL_ORDERS and fractionable:
+            order = api.submit_order(
+                symbol=sym,
+                side="buy",
+                type="market",
+                time_in_force="day",
+                notional=round(notional, 2),
+            )
+            print(f"[ORDER] {sym} BUY notional ${notional:,.2f} (|pos|={abs(target_pos_frac):.3f}) "
+                  f"id={order.id} status={order.status}")
+        else:
+            qty = int(max(1, math.floor(notional / px)))
+            order = api.submit_order(
+                symbol=sym,
+                side="buy",
+                type="market",
+                time_in_force="day",
+                qty=qty,
+            )
+            est = qty * px
+            print(f"[ORDER] {sym} BUY qty {qty} (~${est:,.2f}) (|pos|={abs(target_pos_frac):.3f}) "
+                  f"id={order.id} status={order.status}")
+
+        try:
+            ord_ref = api.get_order(order.id)
+            print(f"[ORDERSTAT] {sym} id={order.id} status={ord_ref.status} "
+                  f"filled={ord_ref.filled_qty} avg_price={getattr(ord_ref, 'filled_avg_price', None)}")
+        except Exception as e2:
+            print(f"[ORDERSTAT_ERR] {sym} {order.id}: {e2}")
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
+
 
 
 
@@ -384,6 +430,14 @@ def compute_dynamic_notional(equity: float, pos_frac: float) -> float:
     else:
         base = MAX_NOTIONAL * abs(pos_frac)
     return float(min(MAX_NOTIONAL, max(1.0, base)))  # at least $1 to avoid 0
+
+def asset_caps(api, sym):
+    try:
+        a = api.get_asset(sym)
+        return bool(a.tradable), bool(a.fractionable), bool(a.shortable), bool(getattr(a, "easy_to_borrow", False))
+    except Exception:
+        return True, True, False, False  # be conservative if lookup fails
+
 
 
 
