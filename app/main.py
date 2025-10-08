@@ -540,7 +540,7 @@ def run_session(api):
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
-     ensure_market_open_or_wait(api)
+    ensure_market_open_or_wait(api)
 
     # session window today
     t_now = now_ny()
