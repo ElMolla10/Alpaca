@@ -329,57 +329,62 @@ def run_session(api):
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
-    # --- start IMMEDIATELY if we're already past session start; otherwise start at session open ---
+    # session window today
     t_now = now_ny()
-    if t_now.hour < SESSION_START_H:
-        # before session start → start at the session open
-        block_start = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-    else:
-        # during session → start right now (no waiting for next hour)
-        block_start = t_now
-    block_end = block_start + dt.timedelta(hours=1)
+    session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
+    session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    # start immediately if already past session_open; else start at session_open
+    block_start = t_now if t_now >= session_open else session_open
+    block_end   = block_start + dt.timedelta(hours=1)
 
     for b in range(SESSION_BLOCKS):
+        # stop if we'd pass the close
+        if block_start >= session_close:
+            print("[INFO] Reached session close window; stopping.")
+            break
+
+        # clamp last block to end at session_close if needed
+        if block_end > session_close:
+            block_end = session_close
+
         print(f"\n=== BLOCK {b+1}/{SESSION_BLOCKS} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
+        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
+
         eq = account_equity(api)
 
-        # enter/update per symbol immediately
-    for sym in SYMBOLS:
-        try:
-            print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-            px = latest_price(api, sym)
-            pred = predict_block_return_pct(api, sym)  # % for next 1h
-
-            if pred == 0.0:
-                print(f"[WARN] {sym}: prediction is 0.0 (check feature pipeline)")
-
-            target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-            print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-            submit_target(api, sym, target_frac, eq, px)
-
-        except Exception as e:
-            print(f"[ERR] symbol {sym}: {e}", flush=True)
-
+        # trade immediately at block_start
+        for sym in SYMBOLS:
+            try:
+                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+                px   = latest_price(api, sym)
+                pred = predict_block_return_pct(api, sym)  # % for next 1h
+                if pred == 0.0:
+                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+                target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                submit_target(api, sym, target_frac, eq, px)
+            except Exception as e:
+                print(f"[ERR] symbol {sym}: {e}", flush=True)
 
         save_state(state)
 
-        # heartbeat until the end of this (now-started) hour block
+        # wait until block_end with a heartbeat
         last_hb = 0
         while now_ny() < block_end:
             time.sleep(10)
             if time.time() - last_hb >= 60:
-                print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}")
+                print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
                 last_hb = time.time()
 
-        # flatten at hour end
+        # flatten at the end of the block
+        print("[EXIT] flattening hour positions...", flush=True)
         for sym in SYMBOLS:
             flatten(api, sym)
 
-        # next block = immediately the next hour from the prior end
+        # advance to next block
         block_start = block_end
-        block_end = block_start + dt.timedelta(hours=1)
-
-    print("[DONE] session finished.")
+        block_end   = block_start + dt.timedelta(hours=1)
 
 
 # =================== ENTRY ===================
