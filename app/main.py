@@ -61,6 +61,12 @@ SYMBOLS    = [os.environ.get("TEST_SYMBOL", "AAPL")] if TEST_MODE else \
 MODEL_PATH = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
 FEATS_PATH = os.environ.get("FEATS_PATH", "app/feat_cols.json")
 
+booster = xgb.Booster()
+booster.load_model(MODEL_PATH)
+
+# (optional) confirm feed choice in logs
+print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
+
 # Internal constants for feature build
 CLIP_HOURLY_RET = 8.0
 HRS_LOOKBACK    = 500
@@ -350,39 +356,26 @@ with open(FEATS_PATH, "r") as f:
     FEAT_COLS = json.load(f)
 print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
 
-def predict_block_return_pct(api, sym):
+def predict_block_return_pct(api: REST, sym: str) -> float:
     """
-    Returns predicted next-1h return in percent.
-    Works with XGBClassifier (probability) or XGBRegressor (direct).
-    Prints strong debug to diagnose feature flow.
+    Predict next-1h return (%) using xgboost.Booster + live features.
     """
     try:
-        df = fetch_recent_features(api, sym)  # must return a DataFrame
+        df = fetch_recent_features(api, sym)
         if df is None or df.empty:
-            print(f"[WARN] {sym}: no features returned")
+            print(f"[WARN] {sym}: no features (empty df)")
             return 0.0
 
-        # Ensure columns exist & align to training order
-        missing = [c for c in FEAT_COLS if c not in df.columns]
-        if missing:
-            print(f"[ERR] {sym}: missing features: {missing[:8]}{'...' if len(missing)>8 else ''}")
-            return 0.0
-
+        # build latest row in training order
         X = df[FEAT_COLS].astype(float).iloc[-1:].values
         last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
         print(f"[DBG] {sym}: feature row OK shape={X.shape} last_ts={last_ts}")
 
-        # Inference
-        if hasattr(model, "predict_proba"):
-            p_up = float(model.predict_proba(X)[0, 1])
-            pred_pct = (p_up - 0.5) * 200.0   # map prob to signed %
-            print(f"[DBG] {sym}: p_up={p_up:.3f} -> pred={pred_pct:.3f}%")
-            return pred_pct
-        else:
-            raw = float(model.predict(X)[0])
-            # If your model outputs normalized return, you’d rescale here.
-            print(f"[DBG] {sym}: reg_pred={raw:.4f} -> pred={raw:.3f}%")
-            return raw
+        # booster inference
+        dmat = xgb.DMatrix(X, feature_names=FEAT_COLS)
+        pred = float(booster.predict(dmat)[0])   # assumes model outputs % per 1h
+        print(f"[DBG] {sym}: booster_pred={pred:.4f}%")
+        return pred
 
     except Exception as e:
         print(f"[ERR] predict {sym}: {e}")
