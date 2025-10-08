@@ -97,6 +97,30 @@ def save_state(st):
     except Exception:
         pass
 
+# ---------- add this helper (near top-level utils) ----------
+def ensure_market_open_or_wait(api):
+    """Start immediately if market is open; otherwise wait until next open."""
+    clock = api.get_clock()
+    if clock.is_open:
+        print("[INFO] Market is open. Starting trading immediately.")
+        return
+
+    ny = pytz.timezone("America/New_York")
+    open_time_ny = clock.next_open.astimezone(ny)
+    now_ny = dt.datetime.now(ny)
+    wait_sec = max(0, (open_time_ny - now_ny).total_seconds())
+    hrs = wait_sec / 3600.0
+    print(f"[WAIT] Market closed. Waiting {hrs:.2f} hours until next open ({open_time_ny}).")
+
+    # Sleep in chunks to avoid very long single sleeps
+    while wait_sec > 0:
+        chunk = min(900, wait_sec)  # 15-minute chunks
+        time.sleep(chunk)
+        wait_sec -= chunk
+
+    print("[INFO] Market is now open. Starting session.")
+
+
 # =================== ALPACA ===================
 def latest_price(api, sym):
     try:
@@ -515,6 +539,8 @@ def run_session(api):
 
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
+
+     ensure_market_open_or_wait(api)
 
     # session window today
     t_now = now_ny()
