@@ -605,15 +605,39 @@ if __name__ == "__main__":
     print("=== START ===", utc_ts())
     try:
         api = REST(KEY_ID, SECRET, BASE_URL, api_version="v2")
+
         clock = api.get_clock()
         print(f"[CLOCK] open={clock.is_open} next_open={clock.next_open} next_close={clock.next_close}")
-        if not clock.is_open:
-            print("[INFO] Market closed. Exiting.")
+
+        if clock.is_open:
+            print("[INFO] Market is open. Starting trading immediately.")
+            run_session(api)
             sys.exit(0)
-        run_session(api)
-        sys.exit(0)
+        else:
+            # Wait until the official next market open from Alpaca, then start.
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            open_utc = clock.next_open.astimezone(dt.timezone.utc)
+            wait_sec = max(0, (open_utc - now_utc).total_seconds())
+            hrs = wait_sec / 3600.0
+            print(f"[WAIT] Market closed. Waiting {hrs:.2f} hours until next open ({open_utc.isoformat()}).")
+
+            # Sleep in chunks to keep logs alive during long waits
+            remaining = wait_sec
+            while remaining > 0:
+                chunk = min(300, remaining)  # 5-minute chunks
+                time.sleep(chunk)
+                remaining -= chunk
+                left_hrs = remaining / 3600.0
+                print(f"[WAIT] ... {left_hrs:.2f} hours remaining until market open.")
+
+            print("[INFO] Market is now open. Starting session.")
+            run_session(api)
+            sys.exit(0)
+
     except KeyError as e:
-        print(f"[FATAL] missing env var: {e}"); sys.exit(2)
+        print(f"[FATAL] missing env var: {e}")
+        sys.exit(2)
     except Exception:
-        traceback.print_exc(); sys.exit(2)
+        traceback.print_exc()
+        sys.exit(2)
 
