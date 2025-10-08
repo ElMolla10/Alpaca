@@ -344,20 +344,22 @@ def run_session(api):
         eq = account_equity(api)
 
         # enter/update per symbol immediately
-for sym in SYMBOLS:
-  try:
-        print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-        px   = latest_price(api, sym)
-        pred = predict_block_return_pct(api, sym)  # % for next 1h
+    for sym in SYMBOLS:
+        try:
+            print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+            px = latest_price(api, sym)
+            pred = predict_block_return_pct(api, sym)  # % for next 1h
 
-        if pred == 0.0:
-            print(f"[WARN] {sym}: prediction is 0.0 (check feature pipeline)")
+            if pred == 0.0:
+                print(f"[WARN] {sym}: prediction is 0.0 (check feature pipeline)")
 
-        target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-        print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-        submit_target(api, sym, target_frac, eq, px)
-    except Exception as e:
-        print(f"[ERR] symbol {sym}: {e}", flush=True)
+            target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+            print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+            submit_target(api, sym, target_frac, eq, px)
+
+        except Exception as e:
+            print(f"[ERR] symbol {sym}: {e}", flush=True)
+
 
         save_state(state)
 
