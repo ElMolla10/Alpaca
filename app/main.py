@@ -131,8 +131,8 @@ def flatten(api, sym):
 
 def submit_target(api, sym, target_pos_frac, equity, px):
     if abs(target_pos_frac) == 0.0:
-    print(f"[SKIP] {sym}: target 0.0 (no signal)")
-    return
+        print(f"[SKIP] {sym}: target 0.0 (no signal)")
+        return
 
 
     notional = min(MAX_NOTIONAL, abs(target_pos_frac) * float(equity))
