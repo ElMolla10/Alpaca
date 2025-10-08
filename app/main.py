@@ -9,6 +9,11 @@ from alpaca_trade_api import REST, TimeFrame
 import xgboost as xgb
 from ta.trend import MACD
 from ta.volatility import BollingerBands
+from datetime import datetime, timezone, timedelta
+
+def rfc3339(dtobj: datetime) -> str:
+    return dtobj.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
 
 # =================== CONFIG / ENV ===================
 TZ_NY = pytz.timezone("America/New_York")
@@ -29,6 +34,11 @@ EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "1"))           # 1 = no smoothing
 DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.5"))     # allow faster re-hedge
 LEVERAGE       = float(os.environ.get("LEVERAGE", "3.0"))
 STOP_LOSS_PCT  = float(os.environ.get("STOP_LOSS_PCT", "2.0"))  # unchanged
+# --- execution controls / sizing ---
+MIN_ABS_POS = float(os.environ.get("MIN_ABS_POS", "0.01"))
+MAX_NOTIONAL = float(os.environ.get("MAX_NOTIONAL", "8000"))
+USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
+
 
 # new optional aggressiveness switches
 FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"
@@ -79,8 +89,17 @@ def latest_price(api, sym):
         tr = api.get_latest_trade(sym)
         return float(tr.price)
     except Exception:
-        bars = api.get_bars(sym, TimeFrame.Minute, limit=1)
-        return float(bars[-1].c) if bars else math.nan
+        now_utc = datetime.now(timezone.utc)
+        start_utc = now_utc - timedelta(days=30)   # or the window you need
+
+        bars = api.get_bars(
+          sym,
+          TimeFrame.Hour,
+          start=rfc3339(start_utc),
+          end=rfc3339(now_utc),
+          adjustment="raw",
+          limit=1000,
+)
 
 def account_equity(api) -> float:
     try:
@@ -144,7 +163,14 @@ def _fetch_hour_bars(api, sym, end_utc=None, hours=HRS_LOOKBACK) -> pd.DataFrame
     if end_utc is None:
         end_utc = dt.datetime.now(dt.timezone.utc)
     start_utc = end_utc - dt.timedelta(hours=hours)
-    bars = api.get_bars(sym, TimeFrame.Hour, start=start_utc, end=end_utc, adjustment='raw', limit=10000)
+    bars = api.get_bars(
+    sym,
+    TimeFrame.Hour,
+    start=rfc3339(start_utc),
+    end=rfc3339(now_utc),
+    adjustment="raw",
+    limit=1000,
+)
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame([{
@@ -248,32 +274,23 @@ def update_pos_ema(prev, new, hl):
     return alpha * new + (1.0 - alpha) * prev
 
 def target_position_from_pred(pred_pct_live, band_R, hl, sym, state):
-    """
-    Map live predicted block return (%) -> target position in [-1, +1].
-    Applies EMA smoothing, Δ-position cap, and optional force-min exposure.
-    """
-    # 1) raw signal -> clipped
-    s = float(pred_pct_live) / max(1e-9, band_R)   # e.g., pred 0.8%, band_R=0.8 -> s=1.0
+    s = float(pred_pct_live) / max(1e-9, band_R)
     s = max(-1.0, min(1.0, s))
 
-    # 2) EMA smoothing
     prev = state["pos_ema"].get(sym, 0.0)
     pos_smooth = update_pos_ema(prev, s, hl)
 
-    # 3) Δ-position cap
     delta = pos_smooth - prev
     if   delta >  DPOS_CAP: pos_smooth = prev + DPOS_CAP
     elif delta < -DPOS_CAP: pos_smooth = prev - DPOS_CAP
 
-    # 4) Optional exposure floor (ensures a trade this block)
-    if FORCE_TRADE:
-        if abs(pos_smooth) < FORCE_MIN_POS:
-            sgn = 1.0 if s >= 0.0 else -1.0   # fall back to long if s==0
-            pos_smooth = sgn * FORCE_MIN_POS
+    if FORCE_TRADE and abs(pos_smooth) < FORCE_MIN_POS:
+        sgn = 1.0 if s >= 0.0 else -1.0
+        pos_smooth = sgn * FORCE_MIN_POS
 
-    # 5) persist & return
     state["pos_ema"][sym] = pos_smooth
     return pos_smooth
+
 
 
 # =================== MAIN LOOP ===================
