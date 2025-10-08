@@ -24,7 +24,7 @@ SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))  # 6 blocks → 10.
 # Live policy params (match backtest)
 # =================== CONFIG (TUNABLE) ===================
 PRIMARY_H      = int(os.environ.get("PRIMARY_H", "1"))        # model trained per 3h block
-BAND_R         = float(os.environ.get("BAND_R", "0.8"))       # smaller = more sensitive
+BAND_R         = float(os.environ.get("BAND_R", "0.45"))       # smaller = more sensitive
 EMA_HALF_LIFE  = int(os.environ.get("EMA_HL", "1"))           # 1 = no smoothing
 DPOS_CAP       = float(os.environ.get("DPOS_CAP", "0.5"))     # allow faster re-hedge
 LEVERAGE       = float(os.environ.get("LEVERAGE", "3.0"))
@@ -32,16 +32,14 @@ STOP_LOSS_PCT  = float(os.environ.get("STOP_LOSS_PCT", "2.0"))  # unchanged
 
 # new optional aggressiveness switches
 FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"
-FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))
+FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.15"))
 
 
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
 # Order sizing
-MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "5000"))
-FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))  # 20% exposure floor
-FORCE_TRADE   = os.environ.get("FORCE_TRADE", "1") == "1"       # enable floor
+MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "8000"))
 
 # Symbols
 TEST_MODE  = os.environ.get("TEST_MODE", "0") == "1"
