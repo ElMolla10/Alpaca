@@ -433,16 +433,22 @@ def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
 
 def compute_dynamic_notional(equity: float, pos_frac: float) -> float:
     """
-    $ notional from position fraction and equity, with caps.
-    - If USE_EQUITY_SIZING: equity * PER_SYM_GROSS_CAP * |pos|
-    - Else: MAX_NOTIONAL * |pos|
-    Always capped by MAX_NOTIONAL.
+    Compute dynamic notional size with a minimum floor and cap.
+    - Starts at BASE_NOTIONAL_PER_TRADE even for weak signals.
+    - Scales up with |pos_frac| (prediction strength).
+    - Never exceeds MAX_NOTIONAL.
     """
     if USE_EQUITY_SIZING:
-        base = float(equity) * PER_SYM_GROSS_CAP * abs(pos_frac)
+        dynamic_size = float(equity) * PER_SYM_GROSS_CAP * abs(pos_frac)
     else:
-        base = MAX_NOTIONAL * abs(pos_frac)
-    return float(min(MAX_NOTIONAL, max(1.0, base)))  # at least $1 to avoid 0
+        dynamic_size = BASE_NOTIONAL_PER_TRADE * abs(pos_frac)
+
+    # enforce min = BASE_NOTIONAL_PER_TRADE and cap = MAX_NOTIONAL
+    notional = max(BASE_NOTIONAL_PER_TRADE, dynamic_size)
+    notional = min(MAX_NOTIONAL, notional)
+
+    return float(notional)
+
 
 def asset_caps(api, sym):
     try:
