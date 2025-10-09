@@ -195,13 +195,13 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
         # 3) final target notional in dollars (respect cap)
         tgt_notional = min(dyn_notional, cap_notional)
 
-        # 4) also floor by MIN_NOTIONAL
-        if tgt_notional < MIN_NOTIONAL:
+        # 4) also floor by BASE_NOTIONAL_PER_TRADE
+        if tgt_notional < BASE_NOTIONAL_PER_TRADE:
             if FORCE_TRADE:
-                print(f"[FORCE] {sym}: lifting notional {tgt_notional:.2f} -> MIN_NOTIONAL {MIN_NOTIONAL:.2f}")
-                tgt_notional = MIN_NOTIONAL
+                print(f"[FORCE] {sym}: lifting notional {tgt_notional:.2f} -> BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
+                tgt_notional = BASE_NOTIONAL_PER_TRADE
             else:
-                print(f"[SKIP] {sym}: notional {tgt_notional:.2f} < MIN_NOTIONAL {MIN_NOTIONAL:.2f}")
+                print(f"[SKIP] {sym}: notional {tgt_notional:.2f} < BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
                 return
 
         side = "buy" if pos_frac > 0 else "sell"
