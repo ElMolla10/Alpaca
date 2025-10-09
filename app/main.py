@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytz
 import numpy as np
 import pandas as pd
-from alpaca_trade_api import REST, TimeFrame
+from alpaca_trade_api.rest import REST, TimeFrame
 import xgboost as xgb
 from ta.trend import MACD
 from ta.volatility import BollingerBands
@@ -50,7 +50,7 @@ SHORTS_ENABLED = os.environ.get("SHORTS_ENABLED", "1") == "1"  # 1=allow shorts
 
 
 # new optional aggressiveness switches
-FORCE_TRADE   = os.environ.get("FORCE_TRADE", "0") == "0"
+FORCE_TRADE   = os.environ.get("FORCE_TRADE", "0") == "1"
 FORCE_MIN_POS = float(os.environ.get("FORCE_MIN_POS", "0.20"))
 
 
@@ -58,7 +58,7 @@ TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
 # Order sizing
-MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "8000"))
+MAX_NOTIONAL_PER_SYM = float(os.environ.get("MAX_NOTIONAL", "10000"))
 
 # Symbols
 TEST_MODE  = os.environ.get("TEST_MODE", "0") == "1"
@@ -150,7 +150,6 @@ def latest_price(api, sym):
         return math.nan
 
 
-
 def account_equity(api) -> float:
     try:
         return float(api.get_account().equity)
@@ -167,6 +166,26 @@ def flatten(api, sym):
             api.submit_order(symbol=sym, qty=abs(qty), side=side, type="market", time_in_force="day")
     except Exception:
         pass
+def linear_notional_from_posfrac(pos_frac: float) -> float:
+    """
+    Linear map: BASE + (MAX-BASE)*|pos|, clipped to [BASE, MAX].
+    Guarantees no rounding down below the $3,000 floor when a trade is taken.
+    """
+    mag = min(max(abs(float(pos_frac)), 0.0), 1.0)
+    raw = BASE_NOTIONAL_PER_TRADE + (MAX_NOTIONAL - BASE_NOTIONAL_PER_TRADE) * mag
+    return float(min(MAX_NOTIONAL, max(BASE_NOTIONAL_PER_TRADE, raw)))
+
+def gross_exposure_and_limit(api) -> tuple[float, float]:
+    acct = api.get_account()
+    equity = float(getattr(acct, "last_equity", acct.equity))
+    limit = 5.0 * equity    # LEVERAGE = 5
+    gross = 0.0
+    try:
+        for p in api.list_positions():
+            gross += abs(float(p.market_value))
+    except Exception:
+        pass
+    return gross, limit
 
 def submit_target(api, sym, target_pos_frac, equity, last_px):
     """
