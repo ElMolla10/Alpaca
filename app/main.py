@@ -194,58 +194,75 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
     last_px: latest trade price
     """
     try:
-        # Enforce MIN_ABS_POS (skip or force)
+        # --- tiny-position gate (floor only if FORCE_TRADE) ---
         pos_frac = float(target_pos_frac)
         if abs(pos_frac) < MIN_ABS_POS:
             if FORCE_TRADE and pos_frac != 0.0:
-                pos_frac = math.copysign(FORCE_MIN_POS, pos_frac)
+                pos_frac = math.copysign(max(MIN_ABS_POS, FORCE_MIN_POS), pos_frac)
                 print(f"[FORCE] {sym}: bumping |pos| to {abs(pos_frac):.3f}")
             else:
                 print(f"[SKIP] {sym}: |pos|={abs(pos_frac):.3f} < MIN_ABS_POS={MIN_ABS_POS:.3f}")
                 return
 
-        # Convert desired position fraction to dollars (dynamic with conviction)
-        # 1) baseline notional scaled by |pos|
-        dyn_notional = BASE_NOTIONAL_PER_TRADE * abs(pos_frac)
+        # --- shorting policy ---
+        if pos_frac < 0 and not SHORTS_ENABLED:
+            print(f"[SKIP] {sym}: shorts disabled")
+            return
 
-        # 2) per-trade cap as fraction of equity
-        cap_notional = PER_TRADE_NOTIONAL_CAP_F * float(equity)
+        # --- linear sizing: BASE → MAX by |pos_frac|, no rounding down ---
+        tgt_notional = linear_notional_from_posfrac(pos_frac)  # uses BASE_NOTIONAL_PER_TRADE & MAX_NOTIONAL
 
-        # 3) final target notional in dollars (respect cap)
-        tgt_notional = dyn_notional
-
-        # Enforce minimum spend
+        # floor enforcement only when forced & nonzero signal (redundant with linear map, kept for clarity)
         if tgt_notional < BASE_NOTIONAL_PER_TRADE:
-            if FORCE_TRADE:
-                print(f"[FORCE] {sym}: lifting notional {tgt_notional:.2f} -> BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
+            if FORCE_TRADE and pos_frac != 0.0:
+                print(f"[FORCE] {sym}: lifting notional → {BASE_NOTIONAL_PER_TRADE:.2f}")
                 tgt_notional = BASE_NOTIONAL_PER_TRADE
             else:
                 print(f"[SKIP] {sym}: notional {tgt_notional:.2f} < BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
                 return
 
-        # Enforce maximum cap (only upper limit)
-        tgt_notional = min(tgt_notional, MAX_NOTIONAL)
-
         side = "buy" if pos_frac > 0 else "sell"
         signed_notional = tgt_notional if pos_frac > 0 else -tgt_notional
 
-        # Use notional (simple orders) or fall back to share qty
-        if USE_NOTIONAL_ORDERS:
-            print(f"[ORDER] {sym} {side.upper()} notional ${tgt_notional:,.2f} (dynamic, |pos|={abs(pos_frac):.3f})")
+        # --- portfolio gross-exposure guard (≤ LEVERAGE × equity) ---
+        gross, limit = gross_exposure_and_limit(api)
+        headroom = max(0.0, limit - gross)
+        if headroom <= 1.0:
+            print(f"[GUARD] gross {gross:,.0f} ≈ limit {limit:,.0f}; skip {sym}")
+            return
+        if abs(signed_notional) > headroom:
+            print(f"[CLIP] {sym}: clip {abs(signed_notional):,.0f} → {headroom:,.0f} by leverage guard")
+            signed_notional = math.copysign(headroom, signed_notional)
+
+        # --- place orders ---
+        if side == "sell" and SHORTS_ENABLED:
+            # Block fractional shorts: convert to integer qty
+            if last_px is None or last_px <= 0 or math.isnan(last_px):
+                print(f"[SKIP] {sym}: invalid price for short")
+                return
+            qty_int = int(abs(signed_notional) / last_px)
+            if qty_int <= 0:
+                print(f"[SKIP] {sym}: short qty rounds to 0 (fractional short blocked)")
+                return
+            est_val = qty_int * last_px
+            print(f"[ORDER] {sym} SELL qty={qty_int} (~${est_val:,.2f}) |pos|={abs(pos_frac):.3f}")
             api.submit_order(
                 symbol=sym,
-                notional=abs(signed_notional),
-                side=side,
+                qty=qty_int,
+                side="sell",
                 type="market",
                 time_in_force="day"
             )
         else:
-            # round to whole shares
-            qty = max(1, int(abs(signed_notional) / max(1e-6, float(last_px))))
-            print(f"[ORDER] {sym} {side.upper()} qty {qty} (dynamic, |pos|={abs(pos_frac):.3f})")
+            # Longs use notional → fractional shares allowed
+            notional_abs = abs(signed_notional)
+            if notional_abs < 1.0:
+                print(f"[SKIP] {sym}: notional too small")
+                return
+            print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} |pos|={abs(pos_frac):.3f}")
             api.submit_order(
                 symbol=sym,
-                qty=qty,
+                notional=notional_abs,
                 side=side,
                 type="market",
                 time_in_force="day"
@@ -253,6 +270,7 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
 
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
+
 
 
 
