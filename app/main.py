@@ -10,6 +10,8 @@ import xgboost as xgb
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_DOWN
+
 
 def rfc3339(dtobj: datetime) -> str:
     return dtobj.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -193,6 +195,10 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
     equity: current account equity in dollars
     last_px: latest trade price
     """
+    def _round_to_cents(x: float) -> float:
+        # Round DOWN to 2dp to satisfy Alpaca "notional value must be limited to 2 decimal places"
+        return float(Decimal(str(max(0.0, x))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
     try:
         # --- tiny-position gate (floor only if FORCE_TRADE) ---
         pos_frac = float(target_pos_frac)
@@ -227,11 +233,12 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
         # --- portfolio gross-exposure guard (≤ LEVERAGE × equity) ---
         gross, limit = gross_exposure_and_limit(api)
         headroom = max(0.0, limit - gross)
-        if headroom <= 1.0:
-            print(f"[GUARD] gross {gross:,.0f} ≈ limit {limit:,.0f}; skip {sym}")
+        headroom = _round_to_cents(headroom)  # enforce 2dp on ceiling too
+        if headroom <= 1.00:
+            print(f"[GUARD] gross {gross:,.2f} ≈ limit {limit:,.2f}; skip {sym}")
             return
         if abs(signed_notional) > headroom:
-            print(f"[CLIP] {sym}: clip {abs(signed_notional):,.0f} → {headroom:,.0f} by leverage guard")
+            print(f"[CLIP] {sym}: clip {abs(signed_notional):,.2f} → {headroom:,.2f} by leverage guard")
             signed_notional = math.copysign(headroom, signed_notional)
 
         # --- place orders ---
@@ -245,6 +252,7 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
                 print(f"[SKIP] {sym}: short qty rounds to 0 (fractional short blocked)")
                 return
             est_val = qty_int * last_px
+            est_val = _round_to_cents(est_val)
             print(f"[ORDER] {sym} SELL qty={qty_int} (~${est_val:,.2f}) |pos|={abs(pos_frac):.3f}")
             api.submit_order(
                 symbol=sym,
@@ -254,9 +262,9 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
                 time_in_force="day"
             )
         else:
-            # Longs use notional → fractional shares allowed
-            notional_abs = abs(signed_notional)
-            if notional_abs < 1.0:
+            # Longs use notional → fractional shares allowed; round notional to 2dp
+            notional_abs = _round_to_cents(abs(signed_notional))
+            if notional_abs < 1.00:
                 print(f"[SKIP] {sym}: notional too small")
                 return
             print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} |pos|={abs(pos_frac):.3f}")
@@ -270,6 +278,7 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
 
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
+
 
 
 
