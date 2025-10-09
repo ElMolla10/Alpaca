@@ -91,9 +91,17 @@ def now_ny():  return dt.datetime.now(TZ_NY)
 
 def load_state():
     try:
-        with open(STATE_PATH, "r") as f: return json.load(f)
+        with open(STATE_PATH, "r") as f:
+            st = json.load(f)
     except Exception:
-        return {"pos_ema": {}, "last_day": ""}
+        st = {"pos_ema": {}, "hold_timer": {}, "last_day": ""}
+
+    # migration/back-fill in case older file exists
+    if "pos_ema" not in st:      st["pos_ema"] = {}
+    if "hold_timer" not in st:   st["hold_timer"] = {}
+    if "last_day" not in st:     st["last_day"] = ""
+    return st
+
 
 def save_state(st):
     try:
@@ -577,8 +585,9 @@ def run_session(api):
     state = load_state()
     today = now_ny().strftime("%Y-%m-%d")
     if state.get("last_day") != today:
-        state = {"pos_ema": {}, "last_day": today}
+        state = {"pos_ema": {}, "hold_timer": {}, "last_day": today}
         save_state(state)
+
 
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
@@ -611,17 +620,32 @@ def run_session(api):
 
         # trade immediately at block_start
         for sym in SYMBOLS:
-            try:
-                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-                px   = latest_price(api, sym)
-                pred = predict_block_return_pct(api, sym)  # % for next 1h
-                if pred == 0.0:
-                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
-                target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-                submit_target(api, sym, target_frac, eq, px)
-            except Exception as e:
-                print(f"[ERR] symbol {sym}: {e}", flush=True)
+    try:
+        # --- HOLD GUARD: if timer > 0, keep current position; skip new order this block ---
+        rem = int(state.get("hold_timer", {}).get(sym, 0))
+        if rem > 0:
+            print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+            continue
+
+        print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+        px   = latest_price(api, sym)
+        pred = predict_block_return_pct(api, sym)  # % for next 1h
+        if pred == 0.0:
+            print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+        target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+        print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+        submit_target(api, sym, target_frac, eq, px)
+
+        # --- NEW: set hold length based on signal strength used for this entry ---
+        absf = abs(target_frac)
+        if absf < 0.25:
+            hold_blocks = 1   # exit after this block (status quo)
+        elif absf < 0.50:
+            hold_blocks = 2   # keep for next block as well
+        else:
+            hold_blocks = 3   # keep for next two blocks
+        state.setdefault("hold_timer", {})[sym] = hold_blocks
+
 
         save_state(state)
 
@@ -633,14 +657,18 @@ def run_session(api):
                 print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
                 last_hb = time.time()
 
-        # flatten at the end of the block
         print("[EXIT] flattening hour positions...", flush=True)
         for sym in SYMBOLS:
-            flatten(api, sym)
-
-        # advance to next block
-        block_start = block_end
-        block_end   = block_start + dt.timedelta(hours=1)
+            rem = int(state.get("hold_timer", {}).get(sym, 0))
+            if rem <= 1:
+                # timer expired (or missing) → close now
+                print(f"[FLATTEN] {sym}: closing position (timer expired)")
+                flatten(api, sym)
+                state["hold_timer"][sym] = 0
+            else:
+                # keep open; decrement
+                state["hold_timer"][sym] = rem - 1
+                print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
 
 # =================== ENTRY ===================
