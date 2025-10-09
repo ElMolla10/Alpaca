@@ -193,7 +193,19 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
         cap_notional = PER_TRADE_NOTIONAL_CAP_F * float(equity)
 
         # 3) final target notional in dollars (respect cap)
-        tgt_notional = max(BASE_NOTIONAL_PER_TRADE, min(dyn_notional, cap_notional))
+        tgt_notional = dyn_notional
+
+        # Enforce minimum spend
+        if tgt_notional < BASE_NOTIONAL_PER_TRADE:
+            if FORCE_TRADE:
+                print(f"[FORCE] {sym}: lifting notional {tgt_notional:.2f} -> BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
+                tgt_notional = BASE_NOTIONAL_PER_TRADE
+            else:
+                print(f"[SKIP] {sym}: notional {tgt_notional:.2f} < BASE_NOTIONAL_PER_TRADE {BASE_NOTIONAL_PER_TRADE:.2f}")
+                return
+
+        # Enforce maximum cap (only upper limit)
+        tgt_notional = min(tgt_notional, MAX_NOTIONAL)
 
         side = "buy" if pos_frac > 0 else "sell"
         signed_notional = tgt_notional if pos_frac > 0 else -tgt_notional
