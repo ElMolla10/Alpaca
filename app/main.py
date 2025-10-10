@@ -46,6 +46,13 @@ MAX_NOTIONAL      = float(os.environ.get("MAX_NOTIONAL", "10000"))  # hard $ cap
 PER_TRADE_NOTIONAL_CAP_F = float(os.environ.get("PER_TRADE_NOTIONAL_CAP_F", "0.75")) # cap per name as fraction of equity (e.g. 0.25 = 25%)
 USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"  # 1 → use notional $, 0 → use share qty
 SHORTS_ENABLED = os.environ.get("SHORTS_ENABLED", "1") == "1"  # 1=allow shorts
+# --- Friday de-risking knobs ---
+FRIDAY_SIZE_MULT_DAY = float(os.environ.get("FRIDAY_SIZE_MULT_DAY", "0.75"))   # 25% reduction all Friday until cutoff
+FRIDAY_SIZE_MULT_LATE = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.50")) # 50% reduction after cutoff
+FRIDAY_LATE_CUTOFF_H = int(os.environ.get("FRIDAY_LATE_CUTOFF_H", "14"))       # 14 => 14:00–14:59, effect from 14:00 block
+FRIDAY_BLOCK_NEW_AFTER_LATE = os.environ.get("FRIDAY_BLOCK_NEW_AFTER_LATE", "1") == "1"
+FRIDAY_MIN_POS = float(os.environ.get("FRIDAY_MIN_POS", "0.03"))               # optional floor to skip tiny Friday trades
+
 
 
 
@@ -88,6 +95,11 @@ STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
 # =================== UTILS ===================
 def utc_ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 def now_ny():  return dt.datetime.now(TZ_NY)
+def is_friday_ny(dt_obj=None):
+    """Return tuple (is_friday_bool, ny_hour_int)."""
+    _now = (dt_obj or dt.datetime.now(dt.timezone.utc)).astimezone(TZ_NY)
+    return (_now.weekday() == 4, _now.hour)
+
 
 def load_state():
     try:
@@ -597,7 +609,6 @@ def run_session(api):
     t_now = now_ny()
     session_open = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
-
     block_start = t_now if t_now >= session_open else session_open
 
     b = 0
@@ -620,6 +631,15 @@ def run_session(api):
 
         eq = account_equity(api)
 
+        # ---- Friday context (computed once per block) ----
+        is_fri, ny_hour = is_friday_ny()
+        is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
+        friday_mult = 1.0
+        if is_fri:
+            friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
+        if is_fri:
+            print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
+
         for sym in SYMBOLS:
             try:
                 # --- HOLD GUARD ---
@@ -628,16 +648,37 @@ def run_session(api):
                     print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
                     continue
 
+                # Block NEW entries after the Friday cutoff (allow reductions/flatten via timers later)
+                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE:
+                    # Only block if not already held this block (rem==0 means no existing Friday hold)
+                    rem = int(state.get("hold_timer", {}).get(sym, 0))
+                    if rem == 0:
+                        print(f"[FRIDAY] {sym}: after {FRIDAY_LATE_CUTOFF_H}:00 ET → blocking NEW entry.")
+                        continue
+
                 print(f"[DBG] fetching & predicting {sym} ...", flush=True)
                 px = latest_price(api, sym)
                 pred = predict_block_return_pct(api, sym)
                 if pred == 0.0:
                     print(f"[WARN] {sym}: prediction is 0.0 (check features)")
 
+                # --- Plan position size ---
                 target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+
+                # Friday size reduction (scales target position → reduces notional)
+                if friday_mult < 1.0 and target_frac != 0.0:
+                    target_frac *= friday_mult
+                    print(f"[FRIDAY] {sym}: size×={friday_mult:.2f} → target_pos={target_frac:+.3f}")
+
+                # Optional Friday floor to skip micro trades
+                if is_fri and abs(target_frac) < FRIDAY_MIN_POS:
+                    print(f"[FRIDAY] {sym}: |target_pos|={abs(target_frac):.3f} < Friday floor {FRIDAY_MIN_POS:.3f} → skip")
+                    continue
+
                 print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
                 submit_target(api, sym, target_frac, eq, px)
 
+                # Determine hold duration by confidence size
                 absf = abs(target_frac)
                 if absf < 0.25:
                     hold_blocks = 1
@@ -675,6 +716,7 @@ def run_session(api):
 
         save_state(state)
         block_start = block_end
+
 
 
 
