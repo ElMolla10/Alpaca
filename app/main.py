@@ -33,10 +33,24 @@ SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))  # 6 blocks → 10.
 # =================== CONFIG (TUNABLE) ===================
 PRIMARY_H      = int(os.environ.get("PRIMARY_H", "1"))        # model trained per 3h block
 # --- dynamic sizing knobs ---
-BAND_R            = float(os.environ.get("BAND_R", "1.10"))   # % per 1h that maps to |pos|=1
-POS_EXP           = float(os.environ.get("POS_EXP", "1.5"))   # convexity: 1=linear, >1 emphasizes strong signals
-EMA_HALF_LIFE     = int(os.environ.get("EMA_HL", "8"))        # smoothing of target position
-DPOS_CAP          = float(os.environ.get("DPOS_CAP", "0.10")) # max change per block
+# --- dynamic sizing knobs ---
+BAND_R            = float(os.environ.get("BAND_R", "1.10"))
+POS_EXP           = float(os.environ.get("POS_EXP", "1.5"))
+EMA_HALF_LIFE     = int(os.environ.get("EMA_HL", "12"))        # ↑ from 8 → 12 to cut turnover
+DPOS_CAP          = float(os.environ.get("DPOS_CAP", "0.05"))  # ↓ from 0.10 → 0.05 (smaller re-hedge steps)
+# --- model-direction + turnover guard ---
+SIGN_MULT         = float(os.environ.get("SIGN_MULT", "-1.0"))   # flip model signal based on CV result
+REBALANCE_BAND    = float(os.environ.get("REBALANCE_BAND", "0.02"))  # skip trades if |Δtarget| < 2%
+
+# --- per-symbol scaling (don’t drop; just size differently) ---
+# Strong: GS, PG, JPM, CVX, AAPL → 1.0
+# Mixed:  MSFT → 0.9
+# Weak:   NVDA, AMD, KO, XOM → 0.5
+PER_SYMBOL_SIZE_MULT = {
+    "GS": 1.00, "PG": 1.00, "JPM": 1.00, "CVX": 1.00, "AAPL": 1.00,
+    "MSFT": 0.90,
+    "NVDA": 0.50, "AMD": 0.50, "KO": 0.50, "XOM": 0.50,
+}
 MAX_POS           = float(os.environ.get("MAX_POS", "0.75"))  # absolute cap on |position|
 MIN_ABS_POS       = float(os.environ.get("MIN_ABS_POS", "0.02"))  # below this → 0
 USE_EQUITY_SIZING = os.environ.get("USE_EQUITY_SIZING", "1") == "1"  # size from equity
@@ -661,9 +675,15 @@ def run_session(api):
                 pred = predict_block_return_pct(api, sym)
                 if pred == 0.0:
                     print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+                pred *= SIGN_MULT
 
                 # --- Plan position size ---
                 target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+
+                sym_mult = PER_SYMBOL_SIZE_MULT.get(sym, 1.0)
+                if sym_mult != 1.0 and target_frac != 0.0:
+                    target_frac *= sym_mult
+                    print(f"[SIZE]  {sym}: per-symbol×={sym_mult:.2f} → target_pos={target_frac:+.3f}")
 
                 # Friday size reduction (scales target position → reduces notional)
                 if friday_mult < 1.0 and target_frac != 0.0:
@@ -677,6 +697,16 @@ def run_session(api):
 
                 print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
                 submit_target(api, sym, target_frac, eq, px)
+
+                # Skip micro rebalances to reduce turnover
+                prev_pos = float(state.get("pos_ema", {}).get(sym, 0.0))
+                if abs(target_frac - prev_pos) < REBALANCE_BAND:
+                    print(f"[SKIP] {sym}: |Δtarget|={abs(target_frac - prev_pos):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
+                    continue
+                    
+                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                submit_target(api, sym, target_frac, eq, px)
+
 
                 # Determine hold duration by confidence size
                 absf = abs(target_frac)
