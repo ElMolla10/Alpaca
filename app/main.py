@@ -616,46 +616,44 @@ def run_session(api):
         print(f"\n=== BLOCK {b+1}/{SESSION_BLOCKS} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
         print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-        eq = account_equity(api)
+                eq = account_equity(api)
 
         # trade immediately at block_start
-    for sym in SYMBOLS:
-        try:
-        # --- HOLD GUARD: if timer > 0, keep current position; skip new order this block ---
-            rem = int(state.get("hold_timer", {}).get(sym, 0))
-            if rem > 0:
-                print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
-                continue
+        for sym in SYMBOLS:
+            try:
+                # --- HOLD GUARD: if timer > 0, keep current position; skip new order this block ---
+                rem = int(state.get("hold_timer", {}).get(sym, 0))
+                if rem > 0:
+                    print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+                    continue
 
-        # (rest of your trading logic goes here)
+                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+                px   = latest_price(api, sym)
+                pred = predict_block_return_pct(api, sym)  # % for next 1h
+                if pred == 0.0:
+                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
 
-        except Exception as e:
-            print(f"[ERR] {sym}: {e}")
+                target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                submit_target(api, sym, target_frac, eq, px)
 
+                # --- hold length from signal strength ---
+                absf = abs(target_frac)
+                if absf < 0.25:
+                    hold_blocks = 1
+                elif absf < 0.50:
+                    hold_blocks = 2
+                else:
+                    hold_blocks = 3
+                state.setdefault("hold_timer", {})[sym] = hold_blocks
 
-
-
-        print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-        px   = latest_price(api, sym)
-        pred = predict_block_return_pct(api, sym)  # % for next 1h
-        if pred == 0.0:
-            print(f"[WARN] {sym}: prediction is 0.0 (check features)")
-        target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-        print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-        submit_target(api, sym, target_frac, eq, px)
-
-        # --- NEW: set hold length based on signal strength used for this entry ---
-        absf = abs(target_frac)
-        if absf < 0.25:
-            hold_blocks = 1   # exit after this block (status quo)
-        elif absf < 0.50:
-            hold_blocks = 2   # keep for next block as well
-        else:
-            hold_blocks = 3   # keep for next two blocks
-        state.setdefault("hold_timer", {})[sym] = hold_blocks
-
+            except Exception as e:
+                import traceback
+                print(f"[ERR] {sym}: {e}")
+                traceback.print_exc(limit=1)
 
         save_state(state)
+
 
         # wait until block_end with a heartbeat
         last_hb = 0
