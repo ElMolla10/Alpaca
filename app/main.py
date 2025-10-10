@@ -51,6 +51,11 @@ PER_SYMBOL_SIZE_MULT = {
     "MSFT": 0.90,
     "NVDA": 0.50, "AMD": 0.50, "KO": 0.50, "XOM": 0.50,
 }
+# --- End-of-week policy ---
+FRIDAY_FORCE_FLATTEN = os.environ.get("FRIDAY_FORCE_FLATTEN", "0") == "1"  # hard flatten all? usually keep 0
+FRIDAY_FLATTEN_AFTER_H = int(os.environ.get("FRIDAY_FLATTEN_AFTER_H", "15"))  # evaluate after 15:00 ET
+FRIDAY_EXPOSURE_CAP = float(os.environ.get("FRIDAY_EXPOSURE_CAP", "0.60"))     # flatten if gross > 60% of equity
+FRIDAY_VOL_LOOKBACK_MIN = int(os.environ.get("FRIDAY_VOL_LOOKBACK_MIN", "90")) # realized vol window (min)
 MAX_POS           = float(os.environ.get("MAX_POS", "0.75"))  # absolute cap on |position|
 MIN_ABS_POS       = float(os.environ.get("MIN_ABS_POS", "0.02"))  # below this → 0
 USE_EQUITY_SIZING = os.environ.get("USE_EQUITY_SIZING", "1") == "1"  # size from equity
@@ -222,6 +227,37 @@ def gross_exposure_and_limit(api) -> tuple[float, float]:
     except Exception:
         pass
     return gross, limit
+
+def realized_vol_last_minutes(api, minutes=90) -> float:
+    # Simple proxy using equity curve is unavailable; use SPY as market proxy.
+    try:
+        end_utc = dt.datetime.now(dt.timezone.utc)
+        start_utc = end_utc - dt.timedelta(minutes=minutes+10)
+        bars = api.get_bars("SPY", TimeFrame.Minute, start=rfc3339(start_utc), end=rfc3339(end_utc), limit=minutes+10, feed=ALPACA_DATA_FEED)
+        if not bars: return 0.0
+        px = np.array([float(b.c) for b in bars], float)
+        r = np.diff(np.log(px)) * 100.0  # % log-returns
+        if r.size < 10: return 0.0
+        return float(np.std(r, ddof=1))  # % per minute (rough)
+    except Exception:
+        return 0.0
+
+def should_flatten_eow(api, equity: float, is_fri: bool, ny_hour: int) -> bool:
+    if not is_fri or ny_hour < FRIDAY_FLATTEN_AFTER_H:
+        return False
+    if FRIDAY_FORCE_FLATTEN:
+        return True
+    gross, _limit = gross_exposure_and_limit(api)
+    gross_frac = gross / max(1e-9, equity)
+    if gross_frac > FRIDAY_EXPOSURE_CAP:
+        print(f"[EOW] gross {gross_frac:.2f} > cap {FRIDAY_EXPOSURE_CAP:.2f}")
+        return True
+    vol_pm = realized_vol_last_minutes(api, FRIDAY_VOL_LOOKBACK_MIN)
+    # Example threshold: flatten if SPY minute σ > 0.20% (tune this)
+    if vol_pm > 0.20:
+        print(f"[EOW] realized vol {vol_pm:.3f}%/min high → flatten")
+        return True
+    return False
 
 def submit_target(api, sym, target_pos_frac, equity, last_px):
     """
@@ -680,6 +716,7 @@ def run_session(api):
                 # --- Plan position size ---
                 target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
 
+                # Per-symbol sizing
                 sym_mult = PER_SYMBOL_SIZE_MULT.get(sym, 1.0)
                 if sym_mult != 1.0 and target_frac != 0.0:
                     target_frac *= sym_mult
@@ -703,10 +740,9 @@ def run_session(api):
                 if abs(target_frac - prev_pos) < REBALANCE_BAND:
                     print(f"[SKIP] {sym}: |Δtarget|={abs(target_frac - prev_pos):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
                     continue
-                    
+
                 print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
                 submit_target(api, sym, target_frac, eq, px)
-
 
                 # Determine hold duration by confidence size
                 absf = abs(target_frac)
@@ -732,6 +768,17 @@ def run_session(api):
             if time.time() - last_hb >= 60:
                 print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
                 last_hb = time.time()
+
+        # ===== EOW: decide flatten BEFORE routine timer-based flatten =====
+        if is_fri and should_flatten_eow(api, eq, is_fri, ny_hour):
+            print("[EOW] Friday policy active → flattening ALL open positions")
+            for sym in SYMBOLS:
+                flatten(api, sym)
+                state.setdefault("hold_timer", {})[sym] = 0
+            save_state(state)
+            block_start = block_end
+            continue
+        # =================================================================
 
         print("[EXIT] flattening hour positions...", flush=True)
         for sym in SYMBOLS:
