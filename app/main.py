@@ -594,65 +594,91 @@ def run_session(api):
 
     ensure_market_open_or_wait(api)
 
-    # session window today
-    t_now = now_ny()
-    session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-    session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
+    # build initial window
+t_now = now_ny()
+session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
+session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
 
-    # start immediately if already past session_open; else start at session_open
-    block_start = t_now if t_now >= session_open else session_open
-    block_end   = block_start + dt.timedelta(hours=1)
+block_start = t_now if t_now >= session_open else session_open
 
-    for b in range(SESSION_BLOCKS):
-        # stop if we'd pass the close
-        if block_start >= session_close:
-            print("[INFO] Reached session close window; stopping.")
-            break
+# round block_start to the next minute boundary you want (keep immediate start)
+# or, if you prefer aligned hours, uncomment the next two lines:
+# if block_start.minute or block_start.second or block_start.microsecond:
+#     block_start = (block_start + dt.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
-        # clamp last block to end at session_close if needed
-        if block_end > session_close:
-            block_end = session_close
+b = 0
+while True:
+    if block_start >= session_close:
+        print("[INFO] Reached session close window; stopping.")
+        break
 
-        print(f"\n=== BLOCK {b+1}/{SESSION_BLOCKS} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
-        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
+    # compute & clamp end BEFORE printing
+    unclamped_end = block_start + dt.timedelta(hours=1)
+    block_end = min(unclamped_end, session_close)
 
-        eq = account_equity(api)
+    # dynamic blocks-left label for logging
+    secs_left = (session_close - block_start).total_seconds()
+    blocks_left = math.ceil(secs_left / 3600.0)
+    b += 1
+    print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
+    print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-        # trade immediately at block_start
-        for sym in SYMBOLS:
-            try:
-                # --- HOLD GUARD: if timer > 0, keep current position; skip new order this block ---
-                rem = int(state.get("hold_timer", {}).get(sym, 0))
-                if rem > 0:
-                    print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
-                    continue
+    eq = account_equity(api)
 
-                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-                px   = latest_price(api, sym)
-                pred = predict_block_return_pct(api, sym)  # % for next 1h
-                if pred == 0.0:
-                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+    # ---- per-symbol work ----
+    for sym in SYMBOLS:
+        try:
+            rem = int(state.get("hold_timer", {}).get(sym, 0))
+            if rem > 0:
+                print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+                continue
 
-                target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-                submit_target(api, sym, target_frac, eq, px)
+            print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+            px   = latest_price(api, sym)
+            pred = predict_block_return_pct(api, sym)
 
-                # --- hold length from signal strength ---
-                absf = abs(target_frac)
-                if absf < 0.25:
-                    hold_blocks = 1
-                elif absf < 0.50:
-                    hold_blocks = 2
-                else:
-                    hold_blocks = 3
-                state.setdefault("hold_timer", {})[sym] = hold_blocks
+            if pred == 0.0:
+                print(f"[WARN] {sym}: prediction is 0.0 (check features)")
 
-            except Exception as e:
-                import traceback
-                print(f"[ERR] {sym}: {e}")
-                traceback.print_exc(limit=1)
+            target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+            print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+            submit_target(api, sym, target_frac, eq, px)
 
-        save_state(state)
+            absf = abs(target_frac)
+            hold_blocks = 1 if absf < 0.25 else (2 if absf < 0.50 else 3)
+            state.setdefault("hold_timer", {})[sym] = hold_blocks
+
+        except Exception as e:
+            import traceback
+            print(f"[ERR] {sym}: {e}")
+            traceback.print_exc(limit=1)
+
+    save_state(state)
+
+    # ---- wait to end of block ----
+    last_hb = 0
+    while now_ny() < block_end:
+        time.sleep(10)
+        if time.time() - last_hb >= 60:
+            print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
+            last_hb = time.time()
+
+    # ---- exit/roll timers ----
+    print("[EXIT] flattening hour positions...", flush=True)
+    for sym in SYMBOLS:
+        rem = int(state.get("hold_timer", {}).get(sym, 0))
+        if rem <= 1:
+            print(f"[FLATTEN] {sym}: closing position (timer expired)")
+            flatten(api, sym)
+            state["hold_timer"][sym] = 0
+        else:
+            state["hold_timer"][sym] = rem - 1
+            print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
+
+    save_state(state)
+
+    # advance window INSIDE the loop
+    block_start = block_end
 
 
         # wait until block_end with a heartbeat
