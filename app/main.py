@@ -682,25 +682,26 @@ while True:
 
 
         # wait until block_end with a heartbeat
-        last_hb = 0
-        while now_ny() < block_end:
-            time.sleep(10)
-            if time.time() - last_hb >= 60:
-                print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
-                last_hb = time.time()
+last_hb = 0
+while now_ny() < block_end:
+    time.sleep(10)
+    if time.time() - last_hb >= 60:
+        print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
+        last_hb = time.time()
 
-        print("[EXIT] flattening hour positions...", flush=True)
-        for sym in SYMBOLS:
-            rem = int(state.get("hold_timer", {}).get(sym, 0))
-            if rem <= 1:
-                # timer expired (or missing) → close now
-                print(f"[FLATTEN] {sym}: closing position (timer expired)")
-                flatten(api, sym)
-                state["hold_timer"][sym] = 0
-            else:
-                # keep open; decrement
-                state["hold_timer"][sym] = rem - 1
-                print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
+print("[EXIT] flattening hour positions...", flush=True)
+for sym in SYMBOLS:
+    rem = int(state.get("hold_timer", {}).get(sym, 0))
+    if rem <= 1:
+        # timer expired (or missing) → close now
+        print(f"[FLATTEN] {sym}: closing position (timer expired)")
+        flatten(api, sym)
+        state["hold_timer"][sym] = 0
+    else:
+        # keep open; decrement
+        state["hold_timer"][sym] = rem - 1
+        print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
+
 
 
 # =================== ENTRY ===================
