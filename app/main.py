@@ -616,7 +616,7 @@ def run_session(api):
         print(f"\n=== BLOCK {b+1}/{SESSION_BLOCKS} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
         print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-                eq = account_equity(api)
+        eq = account_equity(api)
 
         # trade immediately at block_start
         for sym in SYMBOLS:
