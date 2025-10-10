@@ -620,12 +620,18 @@ def run_session(api):
 
         # trade immediately at block_start
         for sym in SYMBOLS:
-    try:
+            try:
         # --- HOLD GUARD: if timer > 0, keep current position; skip new order this block ---
-        rem = int(state.get("hold_timer", {}).get(sym, 0))
-        if rem > 0:
-            print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
-            continue
+                rem = int(state.get("hold_timer", {}).get(sym, 0))
+                if rem > 0:
+                    print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+                    continue
+
+        # (rest of your trading logic goes here)
+        
+            except Exception as e:
+                print(f"[ERR] {sym}: {e}")
+
 
         print(f"[DBG] fetching & predicting {sym} ...", flush=True)
         px   = latest_price(api, sym)
