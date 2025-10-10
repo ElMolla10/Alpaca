@@ -588,119 +588,94 @@ def run_session(api):
         state = {"pos_ema": {}, "hold_timer": {}, "last_day": today}
         save_state(state)
 
-
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
     ensure_market_open_or_wait(api)
 
-    # build initial window
-t_now = now_ny()
-session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
+    # Build initial window
+    t_now = now_ny()
+    session_open = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
+    session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
 
-block_start = t_now if t_now >= session_open else session_open
+    block_start = t_now if t_now >= session_open else session_open
 
-# round block_start to the next minute boundary you want (keep immediate start)
-# or, if you prefer aligned hours, uncomment the next two lines:
-# if block_start.minute or block_start.second or block_start.microsecond:
-#     block_start = (block_start + dt.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    b = 0
+    while True:
+        if block_start >= session_close:
+            print("[INFO] Reached session close window; stopping.")
+            break
 
-b = 0
-while True:
-    if block_start >= session_close:
-        print("[INFO] Reached session close window; stopping.")
-        break
+        # Compute & clamp end BEFORE printing
+        unclamped_end = block_start + dt.timedelta(hours=1)
+        block_end = min(unclamped_end, session_close)
 
-    # compute & clamp end BEFORE printing
-    unclamped_end = block_start + dt.timedelta(hours=1)
-    block_end = min(unclamped_end, session_close)
+        # Dynamic blocks-left label for logging
+        secs_left = (session_close - block_start).total_seconds()
+        blocks_left = math.ceil(secs_left / 3600.0)
+        b += 1
 
-    # dynamic blocks-left label for logging
-    secs_left = (session_close - block_start).total_seconds()
-    blocks_left = math.ceil(secs_left / 3600.0)
-    b += 1
-    print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
-    print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
+        print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
+        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-    eq = account_equity(api)
+        eq = account_equity(api)
 
-    # ---- per-symbol work ----
-    for sym in SYMBOLS:
-        try:
+        for sym in SYMBOLS:
+            try:
+                # --- HOLD GUARD ---
+                rem = int(state.get("hold_timer", {}).get(sym, 0))
+                if rem > 0:
+                    print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+                    continue
+
+                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
+                px = latest_price(api, sym)
+                pred = predict_block_return_pct(api, sym)
+                if pred == 0.0:
+                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+
+                target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
+                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                submit_target(api, sym, target_frac, eq, px)
+
+                absf = abs(target_frac)
+                if absf < 0.25:
+                    hold_blocks = 1
+                elif absf < 0.50:
+                    hold_blocks = 2
+                else:
+                    hold_blocks = 3
+
+                state.setdefault("hold_timer", {})[sym] = hold_blocks
+
+            except Exception as e:
+                import traceback
+                print(f"[ERR] {sym}: {e}")
+                traceback.print_exc(limit=1)
+
+        save_state(state)
+
+        last_hb = 0
+        while now_ny() < block_end:
+            time.sleep(10)
+            if time.time() - last_hb >= 60:
+                print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
+                last_hb = time.time()
+
+        print("[EXIT] flattening hour positions...", flush=True)
+        for sym in SYMBOLS:
             rem = int(state.get("hold_timer", {}).get(sym, 0))
-            if rem > 0:
-                print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
-                continue
+            if rem <= 1:
+                print(f"[FLATTEN] {sym}: closing position (timer expired)")
+                flatten(api, sym)
+                state["hold_timer"][sym] = 0
+            else:
+                state["hold_timer"][sym] = rem - 1
+                print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
-            print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-            px   = latest_price(api, sym)
-            pred = predict_block_return_pct(api, sym)
+        save_state(state)
+        block_start = block_end
 
-            if pred == 0.0:
-                print(f"[WARN] {sym}: prediction is 0.0 (check features)")
-
-            target_frac = target_position_from_pred(pred, BAND_R, EMA_HALF_LIFE, sym, state)
-            print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-            submit_target(api, sym, target_frac, eq, px)
-
-            absf = abs(target_frac)
-            hold_blocks = 1 if absf < 0.25 else (2 if absf < 0.50 else 3)
-            state.setdefault("hold_timer", {})[sym] = hold_blocks
-
-        except Exception as e:
-            import traceback
-            print(f"[ERR] {sym}: {e}")
-            traceback.print_exc(limit=1)
-
-    save_state(state)
-
-    # ---- wait to end of block ----
-    last_hb = 0
-    while now_ny() < block_end:
-        time.sleep(10)
-        if time.time() - last_hb >= 60:
-            print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
-            last_hb = time.time()
-
-    # ---- exit/roll timers ----
-    print("[EXIT] flattening hour positions...", flush=True)
-    for sym in SYMBOLS:
-        rem = int(state.get("hold_timer", {}).get(sym, 0))
-        if rem <= 1:
-            print(f"[FLATTEN] {sym}: closing position (timer expired)")
-            flatten(api, sym)
-            state["hold_timer"][sym] = 0
-        else:
-            state["hold_timer"][sym] = rem - 1
-            print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
-
-    save_state(state)
-
-    # advance window INSIDE the loop
-    block_start = block_end
-
-
-        # wait until block_end with a heartbeat
-last_hb = 0
-while now_ny() < block_end:
-    time.sleep(10)
-    if time.time() - last_hb >= 60:
-        print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
-        last_hb = time.time()
-
-print("[EXIT] flattening hour positions...", flush=True)
-for sym in SYMBOLS:
-    rem = int(state.get("hold_timer", {}).get(sym, 0))
-    if rem <= 1:
-        # timer expired (or missing) → close now
-        print(f"[FLATTEN] {sym}: closing position (timer expired)")
-        flatten(api, sym)
-        state["hold_timer"][sym] = 0
-    else:
-        # keep open; decrement
-        state["hold_timer"][sym] = rem - 1
-        print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
 
 
