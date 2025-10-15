@@ -71,6 +71,7 @@ FRIDAY_SIZE_MULT_LATE = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.50")) #
 FRIDAY_LATE_CUTOFF_H = int(os.environ.get("FRIDAY_LATE_CUTOFF_H", "14"))       # 14 => 14:00–14:59, effect from 14:00 block
 FRIDAY_BLOCK_NEW_AFTER_LATE = os.environ.get("FRIDAY_BLOCK_NEW_AFTER_LATE", "1") == "1"
 FRIDAY_MIN_POS = float(os.environ.get("FRIDAY_MIN_POS", "0.03"))               # optional floor to skip tiny Friday trades
+TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))
 
 
 
@@ -660,22 +661,26 @@ def run_session(api):
     session_open = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
     block_start = t_now if t_now >= session_open else session_open
+    
+    trade_cutoff = session_close - dt.timedelta(minutes=TRADE_CUTOFF_MIN_BEFORE_CLOSE)
+    print(f"[CUTOFF] New trades stop at {trade_cutoff.strftime('%H:%M:%S %Z')} "
+        f"({TRADE_CUTOFF_MIN_BEFORE_CLOSE} min before close).")
 
     b = 0
     while True:
-        if block_start >= session_close:
-            print("[INFO] Reached session close window; stopping.")
+        # Stop scheduling NEW trade blocks once we hit the cutoff window
+        if block_start >= trade_cutoff:
+            print("[INFO] Reached trade cutoff window; no further new trades will be placed.")
             break
 
-        # Compute & clamp end BEFORE printing
+        # End each block no later than the cutoff
         unclamped_end = block_start + dt.timedelta(hours=1)
-        block_end = min(unclamped_end, session_close)
+        block_end = min(unclamped_end, trade_cutoff)
 
-        # Dynamic blocks-left label for logging
-        secs_left = (session_close - block_start).total_seconds()
+        # dynamic label…
+        secs_left = (trade_cutoff - block_start).total_seconds()
         blocks_left = math.ceil(secs_left / 3600.0)
         b += 1
-
         print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
         print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
@@ -693,6 +698,9 @@ def run_session(api):
         for sym in SYMBOLS:
             try:
                 # --- HOLD GUARD ---
+                if now_ny() >= trade_cutoff:
+                    print(f"[CUTOFF] {sym}: within last {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min → blocking NEW entry.")
+                    continue
                 rem = int(state.get("hold_timer", {}).get(sym, 0))
                 if rem > 0:
                     print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
@@ -791,13 +799,19 @@ def run_session(api):
                 state["hold_timer"][sym] = rem - 1
                 print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
+        if now_ny() < session_close:
+            print(f"[POST] Waiting until official close {session_close.strftime('%H:%M:%S %Z')} to flatten.")
+            while now_ny() < session_close:
+                time.sleep(5)
+
+        print("[CLOSE] Market close reached. Final flatten of ALL symbols.")
+        for sym in SYMBOLS:
+            try:
+                flatten(api, sym)
+                state.setdefault("hold_timer", {})[sym] = 0
+            except Exception as e:
+                print(f"[CLOSE_ERR] {sym}: {e}")
         save_state(state)
-        block_start = block_end
-
-
-
-
-
 # =================== ENTRY ===================
 if __name__ == "__main__":
     print("=== START ===", utc_ts())
