@@ -1,16 +1,3 @@
-# app/agent/__init__.py
-from .arl_agent import (
-    ARLAgent,
-    UserStyle,
-    default_style,
-    BlockContext,
-    Decision,
-)
-
-__all__ = [
-    "ARLAgent",
-    "UserStyle",
-    "default_style",
-    "BlockContext",
-    "Decision",
-]
+# app/__init__.py
+# keep the top-level package empty to avoid import errors
+__version__ = "0.0.1"
