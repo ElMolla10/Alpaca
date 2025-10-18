@@ -1,147 +1,140 @@
-# 🧠 Agentic Reinforcement Learning Trading Bot
+🧠 Agentic Reinforcement Learning Trading System
 
-An **autonomous, agentic trading system** that uses numerical prediction, risk management, and adaptive decision-making to trade stocks through **MetaTrader 5 / Alpaca API**.
+This repository implements an agentic reinforcement learning (RL) trading system that adapts to user trading styles, learns from performance, and makes risk-aware trading decisions.
+It integrates data from multiple sources, applies cost and slippage modeling, and uses XGBoost for predictive features.
 
-The bot continuously observes markets, makes trading decisions based on multiple predictive models, executes orders automatically, and learns from results over time.
-
----
-
-## ⚙️ System Overview
-
-### Core Loop
-1. **Observe**
-   - Fetch hourly OHLCV data and features (e.g., volatility, momentum, moving averages).
-   - Preprocess into model-ready format.
-
-2. **Predict**
-   - Gradient-boosted regression model (`XGBoost`) forecasts next-hour return %.
-   - Output normalized for volatility.
-
-3. **Decide + Act**
-   - Position sizing proportional to predicted strength (BAND_R scaling).
-   - Apply Friday risk reduction, kill-switches, and hold-timers.
-   - Send orders to Alpaca / MetaTrader 5 via API.
-
-4. **Learn (Reinforcement)**
-   - Record realized P/L, Sharpe ratio, hit-rate, and drawdown.
-   - Adjust leverage, hold-time, and risk bands based on reward feedback.
-
----
-
-## 🧩 Key Features
-
-| Category | Description |
-|-----------|-------------|
-| **Agentic Control** | Autonomous observe–decide–act–learn cycle. |
-| **Multi-Ticker Training** | Pre-trained across 10 tickers (AAPL, AMD, NVDA, MSFT, JPM, GS, CVX, XOM, PG, KO). |
-| **Risk Management** | Confidence thresholds, volatility sizing, kill-switches, stop-loss, drawdown limits. |
-| **Friday Logic** | Reduces exposure and blocks new entries near session close. |
-| **Backtesting** | 5-year historical replay with transaction cost, slippage, and Sharpe analysis. |
-| **Paper → Live Bridge** | Runs in paper trading first, then connects to MT5 / Alpaca for live execution. |
-
----
-
-## 🧮 Performance Snapshot
-
-| Symbol | CV Sharpe | Hold Sharpe | Direction |
-|:-------|-----------:|------------:|:----------|
-| GS | 0.56 | **1.04** | Short |
-| PG | 0.25 | 0.87 | Short |
-| JPM | 0.73 | 0.75 | Short |
-| CVX | 0.51 | 0.69 | Short |
-| MSFT | 0.95 | 0.54 | Short |
-| AAPL | 0.12 | 0.51 | Short |
-| NVDA | 0.41 | -0.04 | Short |
-| AMD | 0.16 | -0.14 | Short |
-| KO | -0.01 | -1.28 | Short |
-| XOM | **1.41** | -2.12 | Short |
-
----
-
-## 🧠 Agentic Reinforcement Learning Extension
-
-Upcoming reinforcement layer adds dynamic **user-style adaptation**:
-
-- **Input:** User chooses trading style (e.g., *high-risk short-term* or *low-risk long-term*).
-- **Action:** Agent selects volatile or stable stocks accordingly, recalibrates leverage / holding time.
-- **Reward:** Based on Sharpe, drawdown, and realized P/L.
-- **Learning:** Policy updated through reinforcement to maximize long-term reward.
-
----
-
-## 🏗️ Architecture
-
-```
-data/
- ├── *_hourly_last5y_selected_features.csv
-models/
- ├── xgb_boosters/
+📁 Project Structure
 app/
- ├── main.py                # live trading loop
- ├── model_train.py         # training & backtest pipeline
- ├── utils.py               # indicators, volatility, I/O
-state/
- └── bot_state.json         # persistent timers & positions
-```
+ ├── agent/
+ │    ├── __init__.py          # Agent exports and optional modules
+ │    └── arl_agent.py         # Main RL agent logic (core learning, actions)
+ │
+ ├── model/
+ │    ├── __init__.py
+ │    └── XGboost_model.json   # Trained predictive model
+ │
+ ├── execution.py              # Handles order placement, fills, and ledger updates
+ ├── feat_cols.json            # Feature column definitions
+ ├── main.py                   # Entry point (system loop)
+ │
+ ├── render.yaml               # Deployment configuration
+ ├── requirements.txt          # Dependencies
+ ├── runtime.txt               # Python runtime version
+ └── README.md                 # Project documentation
 
----
+⚙️ Core Functionality
+🔹 Reinforcement Learning Agent (arl_agent.py)
 
-## 🖥️ Usage
+Learns from PnL-based rewards (realized profit minus fees and slippage).
 
-```bash
+Adapts position sizing and trade direction dynamically.
+
+Resets state daily to avoid data leakage.
+
+Configurable user styles through the UserStyle dataclass (momentum, mean-reversion, etc.).
+
+🔹 Execution Layer (execution.py)
+
+Manages idempotent orders (safe retries, no duplicates).
+
+Tracks slippage, commission, and partial fills.
+
+Updates a block-based ledger for PnL tracking.
+
+🔹 Model Layer (model/XGboost_model.json)
+
+Predictive model used to guide the RL agent’s initial bias.
+
+Encodes recent price and volatility patterns for symbol selection.
+
+📊 Key Features
+
+Dynamic policy learning per trading block
+
+Fee & slippage modeling for realistic rewards
+
+Risk-adjusted trade sizing
+
+Agent resets per session to avoid lookahead bias
+
+Extendable structure for multi-agent integration (news, sentiment, etc.)
+
+🧠 Reward Mechanism
+
+The agent’s reward is proportional to the block’s net PnL%, ensuring learning aligns with actual profitability:
+
+𝑅
+𝑒
+𝑤
+𝑎
+𝑟
+𝑑
+=
+𝑃
+𝑛
+𝐿
+−
+𝐹
+𝑒
+𝑒
+𝑠
+−
+𝑆
+𝑙
+𝑖
+𝑝
+𝑝
+𝑎
+𝑔
+𝑒
+𝐸
+𝑥
+𝑝
+𝑜
+𝑠
+𝑢
+𝑟
+𝑒
+Reward=
+Exposure
+PnL−Fees−Slippage
+	​
+
+🚀 Running the Project
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Train multi-ticker model
-python app/model_train.py
+# 2. Run main entry
+python -m app.main
 
-# 3. Run live session (paper mode)
-python app/main.py
-```
 
----
+If your module path causes errors, make sure your working directory is set to the project root.
 
-## ⚙️ Configuration
+🧩 Configuration
 
-Edit `config.py` or environment variables before running:
+Edit parameters in UserStyle (inside arl_agent.py) to change behavior:
 
-| Variable | Description |
-|-----------|-------------|
-| `ALPACA_API_KEY` | Your Alpaca API key |
-| `ALPACA_SECRET_KEY` | Your Alpaca secret key |
-| `SESSION_START_H` | Market session start (ET hour) |
-| `FRIDAY_LATE_CUTOFF_H` | Hour to block new Friday entries |
-| `FRIDAY_SIZE_MULT_DAY` | Friday position size multiplier |
-| `FRIDAY_BLOCK_NEW_AFTER_LATE` | True = block new Friday orders |
+Parameter	Description	Example
+max_symbols	number of tradable stocks	8
+prefer_momentum	favor uptrend breakouts	True
+risk_level	risk mode	"high"
+base_size_mult	base position multiplier	1.0
+✅ QA & Validation
 
----
+Checks for missing data, invalid features, or lookahead bias.
 
-## 🛡️ Safety & Risk Rules
+Ensures all orders are unique and consistent across retries.
 
-- Trades only above confidence threshold.
-- Avoids halts / earnings / wide spreads.
-- Size scales down on volatility or Fridays.
-- Auto-flatten at day end; kill-switch on abnormal equity drop.
+Tracks execution success rate and exposure control.
 
----
+👥 Contributors
 
-## 📈 Example Session
+Mohamed Ehab
 
-- **Portfolio:** $99 585.80  (+0.62%)
-- **Daily P/L:** +$611.61
-- **Buying Power:** $314 172.75
-- **Cash:** $65 051.10
+Abdelrahman Tamer
 
----
+Mohamed Atef
 
-## 📅 Roadmap
+Moataz Kamal
 
-1. **Integrate RL policy** for adaptive ticker & parameter selection.
-2. **Expand agentic layer** to learn user style preferences.
-3. **Add CNN chart vision & headline NLP signals.**
-4. **Deploy dashboard** for metrics & alerts.
-
----
-
-## 📜 License
-MIT License – Free for research and non-commercial use.
+Yahia Abdelmonaem
