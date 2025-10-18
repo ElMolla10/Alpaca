@@ -635,7 +635,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     except KeyError as e:
-        print(f("[FATAL] missing env var: {e}"))
+        print(f"[FATAL] missing env var: {e}")
         sys.exit(2)
     except Exception:
         traceback.print_exc()
