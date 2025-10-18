@@ -41,8 +41,8 @@ def default_style(name: str = "high_risk_short_term") -> UserStyle:
             prefer_momentum=True,
             prefer_mean_reversion=False,
             risk_level="high",
-            base_band_R=1.05,   # tighter → more responsive sizing
-            base_ema_hl=6,      # faster EMA
+            base_band_R=1.05,
+            base_ema_hl=6,
             base_size_mult=1.10,
             base_hold_min_blocks=1
         )
@@ -67,7 +67,7 @@ def default_style(name: str = "high_risk_short_term") -> UserStyle:
         prefer_momentum=False,
         prefer_mean_reversion=True,
         risk_level="low",
-        base_band_R=1.20,   # wider → smaller positions for same signal
+        base_band_R=1.20,
         base_ema_hl=10,
         base_size_mult=0.80,
         base_hold_min_blocks=3
@@ -97,11 +97,11 @@ class Decision:
 
 class ARLAgent:
     """
-    Lightweight agentic layer:
-      - Universe selection from recent features (3.3)
-      - Per-symbol gating & dynamic overrides (3.4A–D)
-      - Reward updates with ε-greedy annealing (3.5)
-    Now supports persistence across days via export/import of internal state.
+    Agentic bandit:
+      - Universe selection (ε-greedy)
+      - Per-symbol gating & dynamic overrides
+      - Reward = caller-provided % (now: net PnL% after fees+slippage)
+    Persistence supported via export/import of internal state.
     """
 
     def __init__(self, style: UserStyle, persisted: Optional[dict] = None):
@@ -112,41 +112,30 @@ class ARLAgent:
         self._reward_count: Dict[str, int] = {}
         self._last_seen_ts: Dict[str, float] = {}
 
-        # Exploration schedule (ε-greedy for contextual bandit)
+        # Exploration schedule (ε-greedy)
         self._eps: float = 0.20 if style.risk_level == "high" else (0.12 if style.risk_level == "medium" else 0.08)
         self._eps_min: float = 0.04
-        self._eps_decay: float = 0.995  # applied each update
+        self._eps_decay: float = 0.995
 
-        # Safety rails
+        # Filters
         self._min_sigma_pct: float = 0.20
         self._liquidity_floor_prctile: float = style.min_liquidity_pctile
 
-        # Size governor (placeholder; hook for vol-aware sizing)
-        self._vol_floor = 0.8
-        self._vol_ceiling = 2.5
-
-        # Load persisted learning if provided
         if isinstance(persisted, dict) and persisted:
             try:
                 re = persisted.get("reward_ema", {})
                 rc = persisted.get("reward_count", {})
                 ls = persisted.get("last_seen_ts", {})
                 eps = persisted.get("eps", None)
-
                 if isinstance(re, dict): self._reward_ema = {k: float(v) for k, v in re.items()}
                 if isinstance(rc, dict): self._reward_count = {k: int(v) for k, v in rc.items()}
                 if isinstance(ls, dict): self._last_seen_ts = {k: float(v) for k, v in ls.items()}
                 if isinstance(eps, (int, float)): self._eps = float(eps)
             except Exception:
-                # ignore corrupt persisted blob; start clean
                 pass
 
     # -------- 3.3: Universe building --------
     def build_selection_frame(self, sym_to_df: Dict[str, Optional[pd.DataFrame]]) -> pd.DataFrame:
-        """
-        Build per-symbol frame with signals for universe selection.
-        Expects columns from the live feature pipeline: 'close','ret5','vol20' or 'sigma20_pct','volume'.
-        """
         rows = []
         for sym, df in sym_to_df.items():
             if df is None or df.empty:
@@ -156,21 +145,11 @@ class ARLAgent:
             vol20 = float(last.get("vol20", last.get("sigma20_pct", np.nan)))
             ret5  = float(last.get("ret5", 0.0))
             volume = float(last.get("volume", np.nan))
-
-            liq_proxy = np.nan
             try:
                 liq_proxy = float(df["volume"].tail(20).median())
             except Exception:
-                if not math.isnan(volume):
-                    liq_proxy = volume
-
-            rows.append({
-                "symbol": sym,
-                "close": close,
-                "ret5": ret5,               # recent momentum (%)
-                "sigma_pct": vol20,         # hourly vol proxy (%)
-                "liq": liq_proxy            # liquidity proxy
-            })
+                liq_proxy = volume
+            rows.append({"symbol": sym, "close": close, "ret5": ret5, "sigma_pct": vol20, "liq": liq_proxy})
 
         if not rows:
             return pd.DataFrame(columns=["symbol","score","ret5","sigma_pct","liq"]).set_index("symbol")
@@ -179,18 +158,15 @@ class ARLAgent:
         if feats.empty:
             return pd.DataFrame(columns=["symbol","score","ret5","sigma_pct","liq"]).set_index("symbol")
 
-        # Drop near-zero vol names
         feats = feats.loc[feats["sigma_pct"] >= self._min_sigma_pct]
         if feats.empty:
             return pd.DataFrame(columns=["symbol","score","ret5","sigma_pct","liq"]).set_index("symbol")
 
-        # Liquidity filter: remove bottom X% by volume proxy
         q = np.percentile(feats["liq"].values, self._liquidity_floor_prctile)
         feats = feats.loc[feats["liq"] >= q]
         if feats.empty:
             return pd.DataFrame(columns=["symbol","score","ret5","sigma_pct","liq"]).set_index("symbol")
 
-        # Normalize (z-scores with guard)
         def z(x):
             mu, sd = float(np.nanmean(x)), float(np.nanstd(x))
             sd = sd if sd > 1e-9 else 1.0
@@ -198,11 +174,10 @@ class ARLAgent:
 
         feats["z_mom"] = z(feats["ret5"].fillna(0.0))
         feats["z_vol"] = z(feats["sigma_pct"].clip(lower=1e-6))
+        feats["z_mr"]  = -feats["z_mom"].abs()
 
-        # Style-driven scoring
         w_mom = 0.9 if self.style.prefer_momentum else 0.3
         w_mr  = 0.8 if self.style.prefer_mean_reversion else 0.2
-        feats["z_mr"] = -feats["z_mom"].abs()
         w_vol = 0.3 if self.style.risk_level == "high" else (0.15 if self.style.risk_level == "medium" else 0.0)
 
         feats["score"] = w_mom * feats["z_mom"] + w_mr * feats["z_mr"] + w_vol * feats["z_vol"]
@@ -210,21 +185,14 @@ class ARLAgent:
         return feats[["score","ret5","sigma_pct","liq"]]
 
     def select_universe(self, feats: pd.DataFrame) -> List[str]:
-        """
-        ε-greedy selection: top-N exploit with prob (1-ε); explore from mid ranks with prob ε.
-        """
         if feats is None or feats.empty:
             return []
-        candidates = feats.copy()
         n = self.style.max_symbols
         if np.random.rand() >= self._eps:
-            return list(candidates.head(n).index)
-
-        # Explore: middle 50% bucket
-        k = len(candidates)
-        lo = int(0.25 * k)
-        hi = int(0.75 * k)
-        mid = candidates.iloc[lo:hi] if hi > lo else candidates
+            return list(feats.head(n).index)
+        k = len(feats)
+        lo, hi = int(0.25*k), int(0.75*k)
+        mid = feats.iloc[lo:hi] if hi > lo else feats
         pick = min(n, max(1, len(mid)))
         return list(mid.sample(pick, replace=False, random_state=np.random.randint(1_000_000)).index)
 
@@ -232,25 +200,21 @@ class ARLAgent:
     def decide_for_symbol(self, sym: str, ctx: BlockContext) -> Decision:
         if ctx.minutes_to_close <= 30.0:
             return Decision(allow=False)
-
         if ctx.is_friday and ctx.is_late and self.style.risk_level != "high":
             return Decision(allow=False)
 
         r_ema = self._reward_ema.get(sym, 0.0)
-        # Confidence from reward EMA (sigmoid on %-returns)
-        conf = 1.0 / (1.0 + math.exp(-0.8 * r_ema))
+        conf = 1.0 / (1.0 + math.exp(-0.8 * r_ema))  # sigmoid on %-PnL
 
-        base_band = self.style.base_band_R
-        base_hl   = self.style.base_ema_hl
-        base_sz   = self.style.base_size_mult
-        base_hold = self.style.base_hold_min_blocks
+        base_band, base_hl, base_sz, base_hold = (
+            self.style.base_band_R, self.style.base_ema_hl, self.style.base_size_mult, self.style.base_hold_min_blocks
+        )
 
         band_R = float(np.interp(conf, [0.0, 1.0], [base_band * 1.20, base_band * 0.85]))
         ema_hl = int(round(np.interp(conf, [0.0, 1.0], [max(3, base_hl + 3), max(2, base_hl - 2)])))
         size_m = float(np.interp(conf, [0.0, 1.0], [base_sz * 0.70, base_sz * 1.30]))
         hold_b = int(round(np.interp(conf, [0.0, 1.0], [max(1, base_hold), max(1, base_hold + 1)])))
 
-        # Extra Friday conservatism
         if ctx.is_friday:
             if ctx.is_late:
                 band_R *= 1.10
@@ -259,31 +223,23 @@ class ARLAgent:
             else:
                 size_m *= 0.95
 
-        # Clamp size multiplier to reasonable bounds
         size_m = float(np.clip(size_m, 0.6 * base_sz, 1.3 * base_sz))
 
-        return Decision(
-            allow=True,
-            band_R_override=band_R,
-            ema_hl_override=ema_hl,
-            size_mult=size_m,
-            hold_min_blocks=hold_b
-        )
+        return Decision(True, band_R_override=band_R, ema_hl_override=ema_hl, size_mult=size_m, hold_min_blocks=hold_b)
 
     # -------- 3.5: Rewards / annealing --------
-    def update_rewards(self, sym_to_realized: Dict[str, float]) -> None:
+    def update_rewards(self, sym_to_reward_pct: Dict[str, float]) -> None:
         """
-        sym_to_realized: per-symbol realized % (e.g., last-hour move or PnL%)
-        Maintains reward EMA and decays ε toward exploitation.
+        Reward units are percent (%), caller supplies **net PnL%** per symbol for the block.
         """
-        if not sym_to_realized:
+        if not sym_to_reward_pct:
             self._eps = max(self._eps_min, self._eps * self._eps_decay)
             return
 
         now = time.time()
         alpha = 0.25 if self.style.risk_level == "high" else (0.20 if self.style.risk_level == "medium" else 0.15)
 
-        for sym, r in sym_to_realized.items():
+        for sym, r in sym_to_reward_pct.items():
             prev = self._reward_ema.get(sym, 0.0)
             ema = (1.0 - alpha) * prev + alpha * float(r)
             self._reward_ema[sym] = ema
