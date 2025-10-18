@@ -6,6 +6,7 @@ from .arl_agent import (
     BlockContext,
     Decision,
 )
+from .execution import BlockLedger  # optional export
 
 __all__ = [
     "ARLAgent",
@@ -13,4 +14,5 @@ __all__ = [
     "default_style",
     "BlockContext",
     "Decision",
+    "BlockLedger",
 ]
