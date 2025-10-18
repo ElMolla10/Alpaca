@@ -16,6 +16,7 @@ from alpaca_trade_api.rest import REST, TimeFrame
 
 # === Agentic RL layer ===
 from app.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
+from app.execution import BlockLedger  # NEW: fees + slippage-aware reward
 
 # =================== CONFIG / ENV ===================
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
@@ -26,8 +27,7 @@ KEY_ID   = os.environ["APCA_API_KEY_ID"]
 SECRET   = os.environ["APCA_API_SECRET_KEY"]
 
 # Market session
-SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET default
-SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))     # compatibility, not used in loop
+SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET
 TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))
 
 # Model / policy
@@ -61,7 +61,7 @@ AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
 AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "8"))
 
-# Trading costs
+# Trading costs (BPS)
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
@@ -79,11 +79,7 @@ booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
 print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 
-# Internal feature constants
-CLIP_HOURLY_RET = 8.0
-HRS_LOOKBACK    = 500
-
-# Persist EMA state across blocks + agent learning across days
+# Persist state
 STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
 
 # Per-symbol size multipliers (optional tuning)
@@ -98,7 +94,7 @@ def now_ny():  return dt.datetime.now(TZ_NY)
 
 def is_friday_ny() -> tuple[bool, int]:
     n = now_ny()
-    return (n.weekday() == 4), n.hour  # Monday=0 ... Friday=4
+    return (n.weekday() == 4), n.hour
 
 def load_state():
     try:
@@ -109,7 +105,7 @@ def load_state():
     if "pos_ema" not in st:    st["pos_ema"] = {}
     if "hold_timer" not in st: st["hold_timer"] = {}
     if "last_day" not in st:   st["last_day"] = ""
-    if "agent" not in st:      st["agent"] = {}          # <<< NEW: agent learning blob
+    if "agent" not in st:      st["agent"] = {}
     return st
 
 def save_state(st):
@@ -164,7 +160,11 @@ def account_equity(api) -> float:
     except Exception:
         return 0.0
 
-def flatten(api, sym):
+def flatten(api, sym, ledger: BlockLedger | None = None):
+    """
+    Market-close flatten: submits and (if ledger provided) records an approximate fill
+    at the latest trade price for reward accounting with fees+slippage.
+    """
     try:
         p = api.get_position(sym)
         qty = float(p.qty)
@@ -172,6 +172,10 @@ def flatten(api, sym):
             side = "sell" if qty > 0 else "buy"
             print(f"[FLATTEN] {sym} qty={qty}")
             api.submit_order(symbol=sym, qty=abs(qty), side=side, type="market", time_in_force="day")
+            # Approximate fill for reward accounting
+            if ledger is not None:
+                px = latest_price(api, sym)
+                ledger.record_fill(sym, side=side, qty=abs(qty), price=px)
     except Exception:
         pass
 
@@ -192,9 +196,10 @@ def linear_notional_from_posfrac(pos_frac: float) -> float:
     raw = BASE_NOTIONAL_PER_TRADE + (MAX_NOTIONAL - BASE_NOTIONAL_PER_TRADE) * mag
     return float(min(MAX_NOTIONAL, max(BASE_NOTIONAL_PER_TRADE, raw)))
 
-def submit_target(api, sym, target_pos_frac, equity, last_px):
+def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedger | None = None):
     """
     target_pos_frac: [-1..+1] desired fraction per name (our “position”), signed.
+    Records an approximate fill to the ledger (fees+slippage accounted).
     """
     def _round_to_cents(x: float) -> float:
         return float(Decimal(str(max(0.0, x))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
@@ -223,7 +228,7 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
             print(f"[GUARD] gross {gross:,.2f} ≈ limit {limit:,.2f}; skip {sym}")
             return
         if abs(signed_notional) > headroom:
-            print(f"[CLIP] {sym}: clip {abs(signed_notional):,.2f} → {headroom:,.2f} by leverage guard")
+            print(f"[CLIP] {sym}: clip {abs(signed_notional):, .2f} → {headroom:,.2f} by leverage guard")
             signed_notional = math.copysign(headroom, signed_notional)
 
         if side == "sell" and SHORTS_ENABLED:
@@ -236,6 +241,9 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
                 return
             print(f"[ORDER] {sym} SELL qty={qty_int} (~${qty_int*last_px:,.2f}) |pos|={abs(pos_frac):.3f}")
             api.submit_order(symbol=sym, qty=qty_int, side="sell", type="market", time_in_force="day")
+            # Approx fill record (short open/extend)
+            if ledger is not None:
+                ledger.record_fill(sym, side="sell", qty=qty_int, price=last_px)
         else:
             notional_abs = _round_to_cents(abs(signed_notional))
             if notional_abs < 1.00:
@@ -243,6 +251,10 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
                 return
             print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} |pos|={abs(pos_frac):.3f}")
             api.submit_order(symbol=sym, notional=notional_abs, side=side, type="market", time_in_force="day")
+            # Approx fill record (long open/extend) — estimate qty from notional/price
+            if ledger is not None and last_px and last_px > 0 and not math.isnan(last_px):
+                qty_est = notional_abs / last_px
+                ledger.record_fill(sym, side=side, qty=qty_est, price=last_px)
 
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
@@ -332,7 +344,6 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
 
     df = df.dropna().reset_index(drop=True)
 
-    # Ensure all FEAT_COLS exist
     for c in FEAT_COLS:
         if c not in df.columns:
             df[c] = 0.0
@@ -344,8 +355,7 @@ def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
     s = float(pred_pct) / max(1e-12, band_R)
     s = max(-10.0, min(10.0, s))
     mag = abs(s) ** exp_
-    pos = (1.0 if s >= 0 else -1.0) * min(1.0, mag)
-    return pos
+    return (1.0 if s >= 0 else -1.0) * min(1.0, mag)
 
 def update_pos_ema(prev: float, target: float, half_life: int) -> float:
     if half_life <= 1:
@@ -388,12 +398,11 @@ def run_session(api):
     state = load_state()
     today = now_ny().strftime("%Y-%m-%d")
     if state.get("last_day") != today:
-        # Preserve agent learning across days, reset intraday-only pieces
         state = {
             "pos_ema": {},
             "hold_timer": {},
             "last_day": today,
-            "agent": state.get("agent", {})   # keep learned RL state
+            "agent": state.get("agent", {})   # persist agent learning across days
         }
         save_state(state)
 
@@ -402,7 +411,6 @@ def run_session(api):
 
     ensure_market_open_or_wait(api)
 
-    # Longs-only: cover any pre-existing shorts immediately
     if LONGS_ONLY:
         try:
             for p in api.list_positions():
@@ -416,13 +424,11 @@ def run_session(api):
         except Exception as e:
             print(f"[LONGS_ONLY_ERR] pre-open cover: {e}")
 
-    # Agent init with persisted learning
     agent_style = default_style(USER_STYLE)
     agent_style.max_symbols = AGENT_MAX_SYMBOLS
     agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
     print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
 
-    # Build initial window
     t_now = now_ny()
     session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -433,6 +439,8 @@ def run_session(api):
         if block_start >= session_close:
             print("[INFO] Reached session close window; stopping.")
             break
+
+        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)  # NEW: per-block fees+slippage accounting
 
         unclamped_end = block_start + dt.timedelta(hours=1)
         block_end = min(unclamped_end, session_close)
@@ -446,7 +454,6 @@ def run_session(api):
 
         eq = account_equity(api)
 
-        # Friday context
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
         friday_mult = 1.0
@@ -454,7 +461,6 @@ def run_session(api):
             friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
             print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
 
-        # Trade cutoff before close
         minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
         cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
 
@@ -472,16 +478,15 @@ def run_session(api):
 
         for sym in SYMBOLS:
             try:
-                # HOLD GUARD
                 rem = int(state.get("hold_timer", {}).get(sym, 0))
                 if rem > 0:
                     print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
                     continue
 
-                # >>> AGENT 3.4A BEGIN
                 if AGENTIC_MODE and (sym not in trade_universe):
                     print(f"[AGENT] {sym}: not selected this block → skip")
                     continue
+
                 ctx = BlockContext(
                     is_friday=is_fri,
                     is_late=is_late,
@@ -492,14 +497,11 @@ def run_session(api):
                 if not dec.allow:
                     print(f"[AGENT] {sym}: decision=blocked")
                     continue
-                # >>> AGENT 3.4A END
 
-                # Friday late: block NEW entries
                 if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and rem == 0:
                     print(f"[FRIDAY] {sym}: after {FRIDAY_LATE_CUTOFF_H}:00 ET → blocking NEW entry.")
                     continue
 
-                # Close cutoff: block NEW entries
                 if cutoff_active and rem == 0:
                     print(f"[CUTOFF] {sym}: {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min to close → blocking NEW entry.")
                     continue
@@ -534,9 +536,8 @@ def run_session(api):
                     continue
 
                 print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
-                submit_target(api, sym, target_frac, eq, px)
+                submit_target(api, sym, target_frac, eq, px, ledger=ledger)
 
-                # Hold duration
                 absf = abs(target_frac)
                 if dec.hold_min_blocks is not None:
                     hold_blocks = int(max(1, dec.hold_min_blocks))
@@ -560,20 +561,9 @@ def run_session(api):
                 print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
                 last_hb = time.time()
 
-        # >>> AGENT 3.5 BEGIN: reward update (proxy: last hour % move)
-        sym_to_realized = {}
-        for s in trade_universe:
-            try:
-                df_last = sym_to_df.get(s)
-                if df_last is None or df_last.empty:
-                    continue
-                if len(df_last) >= 2:
-                    r = (df_last["close"].iloc[-1] / df_last["close"].iloc[-2] - 1.0) * 100.0
-                    sym_to_realized[s] = float(r)
-            except Exception:
-                pass
-        agent.update_rewards(sym_to_realized)
-        # Persist agent learning each block
+        # >>> AGENT 3.5 BEGIN: reward update using **net PnL% after fees+slippage**
+        pnl_pct_by_symbol = ledger.compute_block_pnl_pct()
+        agent.update_rewards(pnl_pct_by_symbol)
         state["agent"] = agent.export_state()
         save_state(state)
         # >>> AGENT 3.5 END
@@ -583,7 +573,7 @@ def run_session(api):
             rem = int(state.get("hold_timer", {}).get(sym, 0))
             if rem <= 1:
                 print(f"[FLATTEN] {sym}: closing position (timer expired)")
-                flatten(api, sym)
+                flatten(api, sym, ledger=ledger)
                 state["hold_timer"][sym] = 0
             else:
                 state["hold_timer"][sym] = rem - 1
@@ -622,7 +612,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     except KeyError as e:
-        print(f"[FATAL] missing env var: {e}")  # <<< fixed formatting
+        print(f"[FATAL] missing env var: {e}")
         sys.exit(2)
     except Exception:
         traceback.print_exc()
