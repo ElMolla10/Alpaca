@@ -15,7 +15,7 @@ from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
 
 # === Agentic RL layer ===
-from app.agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
+from app.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
 
 # =================== CONFIG / ENV ===================
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
@@ -28,7 +28,7 @@ SECRET   = os.environ["APCA_API_SECRET_KEY"]
 # Market session
 SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET default
 SESSION_BLOCKS  = int(os.environ.get("SESSION_BLOCKS", "6"))     # compatibility, not used in loop
-TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))  # stop new entries this many minutes before 16:00
+TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))
 
 # Model / policy
 PRIMARY_H          = int(os.environ.get("PRIMARY_H", "1"))
@@ -46,7 +46,7 @@ PER_TRADE_NOTIONAL_CAP_F = float(os.environ.get("PER_TRADE_NOTIONAL_CAP_F", "0.7
 USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
 SHORTS_ENABLED     = os.environ.get("SHORTS_ENABLED", "1") == "1"
 LONGS_ONLY         = os.environ.get("LONGS_ONLY", "0") == "1"
-SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.0"))    # allow global sign flip if desired
+SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.0"))
 REBALANCE_BAND     = float(os.environ.get("REBALANCE_BAND", "0.03"))
 
 # Friday rules
@@ -54,11 +54,11 @@ FRIDAY_LATE_CUTOFF_H         = int(os.environ.get("FRIDAY_LATE_CUTOFF_H", "14"))
 FRIDAY_SIZE_MULT_DAY         = float(os.environ.get("FRIDAY_SIZE_MULT_DAY", "0.75"))
 FRIDAY_SIZE_MULT_LATE        = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.50"))
 FRIDAY_BLOCK_NEW_AFTER_LATE  = os.environ.get("FRIDAY_BLOCK_NEW_AFTER_LATE", "1") == "1"
-FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))  # floor to skip micro trades
+FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))
 
 # Agentic switches
-AGENTIC_MODE     = os.environ.get("AGENTIC_MODE", "1") == "1"
-USER_STYLE       = os.environ.get("USER_STYLE", "high_risk_short_term")
+AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
+USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
 AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "8"))
 
 # Trading costs
@@ -83,10 +83,10 @@ print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 CLIP_HOURLY_RET = 8.0
 HRS_LOOKBACK    = 500
 
-# Persist EMA state across blocks
+# Persist EMA state across blocks + agent learning across days
 STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
 
-# Per-symbol size multipliers (can be tuned or adapted by agent)
+# Per-symbol size multipliers (optional tuning)
 PER_SYMBOL_SIZE_MULT = {sym: 1.0 for sym in SYMBOLS}
 
 # =================== UTILS ===================
@@ -105,10 +105,11 @@ def load_state():
         with open(STATE_PATH, "r") as f:
             st = json.load(f)
     except Exception:
-        st = {"pos_ema": {}, "hold_timer": {}, "last_day": ""}
+        st = {"pos_ema": {}, "hold_timer": {}, "last_day": "", "agent": {}}
     if "pos_ema" not in st:    st["pos_ema"] = {}
     if "hold_timer" not in st: st["hold_timer"] = {}
     if "last_day" not in st:   st["last_day"] = ""
+    if "agent" not in st:      st["agent"] = {}          # <<< NEW: agent learning blob
     return st
 
 def save_state(st):
@@ -119,7 +120,6 @@ def save_state(st):
         pass
 
 def ensure_market_open_or_wait(api):
-    """Start immediately if market is open; otherwise wait until next open."""
     clock = api.get_clock()
     if getattr(clock, "is_open", False):
         print("[INFO] Market is open. Starting trading immediately.")
@@ -199,7 +199,6 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
     def _round_to_cents(x: float) -> float:
         return float(Decimal(str(max(0.0, x))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
     try:
-        # Hard guard: longs-only day
         if LONGS_ONLY and target_pos_frac < 0:
             print(f"[LONGS_ONLY] {sym}: short target blocked.")
             return
@@ -218,7 +217,6 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
         side = "buy" if pos_frac > 0 else "sell"
         signed_notional = tgt_notional if pos_frac > 0 else -tgt_notional
 
-        # Portfolio leverage guard
         gross, limit = gross_exposure_and_limit(api)
         headroom = _round_to_cents(max(0.0, limit - gross))
         if headroom <= 1.00:
@@ -228,7 +226,6 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
             print(f"[CLIP] {sym}: clip {abs(signed_notional):,.2f} → {headroom:,.2f} by leverage guard")
             signed_notional = math.copysign(headroom, signed_notional)
 
-        # Shorts: convert to qty, cap to available to avoid “insufficient qty” errors
         if side == "sell" and SHORTS_ENABLED:
             if last_px is None or last_px <= 0 or math.isnan(last_px):
                 print(f"[SKIP] {sym}: invalid price for short")
@@ -237,11 +234,9 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
             if qty_int <= 0:
                 print(f"[SKIP] {sym}: short qty rounds to 0")
                 return
-            # If covering an existing long? Actually side == "sell" opens/extends short here.
             print(f"[ORDER] {sym} SELL qty={qty_int} (~${qty_int*last_px:,.2f}) |pos|={abs(pos_frac):.3f}")
             api.submit_order(symbol=sym, qty=qty_int, side="sell", type="market", time_in_force="day")
         else:
-            # Longs: use notional (fractional allowed)
             notional_abs = _round_to_cents(abs(signed_notional))
             if notional_abs < 1.00:
                 print(f"[SKIP] {sym}: notional too small")
@@ -250,7 +245,6 @@ def submit_target(api, sym, target_pos_frac, equity, last_px):
             api.submit_order(symbol=sym, notional=notional_abs, side=side, type="market", time_in_force="day")
 
     except Exception as e:
-        # Special handling: if trying to sell more than available when *covering* a short via BUY path
         print(f"[ORDER_ERR] {sym}: {e}")
 
 # =================== FEATURE PIPELINE (LIVE) ===================
@@ -308,7 +302,7 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
         print(f"[WARN] {sym}: bars after RTH filter are empty")
         return df
 
-    # Base indicators (align to training)
+    # Indicators (align to training)
     df["price_change_pct"] = df["close"].pct_change() * 100.0
     macd_ind = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
     df["MACDh_12_26_9"] = macd_ind.macd_diff()
@@ -394,7 +388,13 @@ def run_session(api):
     state = load_state()
     today = now_ny().strftime("%Y-%m-%d")
     if state.get("last_day") != today:
-        state = {"pos_ema": {}, "hold_timer": {}, "last_day": today}
+        # Preserve agent learning across days, reset intraday-only pieces
+        state = {
+            "pos_ema": {},
+            "hold_timer": {},
+            "last_day": today,
+            "agent": state.get("agent", {})   # keep learned RL state
+        }
         save_state(state)
 
     acct = api.get_account()
@@ -416,10 +416,10 @@ def run_session(api):
         except Exception as e:
             print(f"[LONGS_ONLY_ERR] pre-open cover: {e}")
 
-    # Agent init
+    # Agent init with persisted learning
     agent_style = default_style(USER_STYLE)
     agent_style.max_symbols = AGENT_MAX_SYMBOLS
-    agent = ARLAgent(agent_style)
+    agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
     print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
 
     # Build initial window
@@ -434,11 +434,9 @@ def run_session(api):
             print("[INFO] Reached session close window; stopping.")
             break
 
-        # Compute & clamp end BEFORE printing
         unclamped_end = block_start + dt.timedelta(hours=1)
         block_end = min(unclamped_end, session_close)
 
-        # Dynamic blocks-left label for logging
         secs_left = (session_close - block_start).total_seconds()
         blocks_left = math.ceil(secs_left / 3600.0)
         b += 1
@@ -448,7 +446,7 @@ def run_session(api):
 
         eq = account_equity(api)
 
-        # ---- Friday context (computed once per block) ----
+        # Friday context
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
         friday_mult = 1.0
@@ -456,11 +454,11 @@ def run_session(api):
             friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
             print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
 
-        # ---- Trade cutoff before close: block new entries inside cutoff window ----
+        # Trade cutoff before close
         minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
         cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
 
-        # >>> AGENT 3.3 BEGIN: build selection features & choose universe
+        # >>> AGENT 3.3 BEGIN
         sym_to_df = {}
         for s in SYMBOLS:
             try:
@@ -474,13 +472,13 @@ def run_session(api):
 
         for sym in SYMBOLS:
             try:
-                # --- HOLD GUARD ---
+                # HOLD GUARD
                 rem = int(state.get("hold_timer", {}).get(sym, 0))
                 if rem > 0:
                     print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
                     continue
 
-                # >>> AGENT 3.4A BEGIN: agent gating & decision
+                # >>> AGENT 3.4A BEGIN
                 if AGENTIC_MODE and (sym not in trade_universe):
                     print(f"[AGENT] {sym}: not selected this block → skip")
                     continue
@@ -496,13 +494,12 @@ def run_session(api):
                     continue
                 # >>> AGENT 3.4A END
 
-                # Block NEW entries after Friday cutoff (allow reductions/flatten via timers later)
-                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE:
-                    if rem == 0:
-                        print(f"[FRIDAY] {sym}: after {FRIDAY_LATE_CUTOFF_H}:00 ET → blocking NEW entry.")
-                        continue
+                # Friday late: block NEW entries
+                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and rem == 0:
+                    print(f"[FRIDAY] {sym}: after {FRIDAY_LATE_CUTOFF_H}:00 ET → blocking NEW entry.")
+                    continue
 
-                # Block NEW entries when within the close cutoff window
+                # Close cutoff: block NEW entries
                 if cutoff_active and rem == 0:
                     print(f"[CUTOFF] {sym}: {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min to close → blocking NEW entry.")
                     continue
@@ -514,35 +511,23 @@ def run_session(api):
                     print(f"[WARN] {sym}: prediction is 0.0 (check features)")
                 pred *= SIGN_MULT
 
-                # >>> AGENT 3.4B BEGIN: apply agent overrides
                 band_R_used = dec.band_R_override if dec.band_R_override is not None else BAND_R
                 ema_hl_used = dec.ema_hl_override if dec.ema_hl_override is not None else EMA_HALF_LIFE
-                # >>> AGENT 3.4B END
 
-                # >>> AGENT 3.4C BEGIN: compute target with overrides + agent size
                 target_frac = target_position_from_pred(pred, band_R_used, ema_hl_used, sym, state)
                 if dec.size_mult and target_frac != 0.0:
                     target_frac *= float(dec.size_mult)
                     print(f"[AGENT] {sym}: size×={dec.size_mult:.2f} → target_pos={target_frac:+.3f}")
-                # >>> AGENT 3.4C END
 
-                # Per-symbol static size multiplier (optional)
                 sym_mult = PER_SYMBOL_SIZE_MULT.get(sym, 1.0)
                 if sym_mult != 1.0 and target_frac != 0.0:
                     target_frac *= sym_mult
                     print(f"[SIZE]  {sym}: per-symbol×={sym_mult:.2f} → target_pos={target_frac:+.3f}")
 
-                # Friday size reduction
                 if is_fri and friday_mult < 1.0 and target_frac != 0.0:
                     target_frac *= friday_mult
                     print(f"[FRIDAY] {sym}: size×={friday_mult:.2f} → target_pos={target_frac:+.3f}")
 
-                # Friday micro-trade floor
-                if is_fri and abs(target_frac) < FRIDAY_MIN_POS:
-                    print(f"[FRIDAY] {sym}: |target_pos|={abs(target_frac):.3f} < floor {FRIDAY_MIN_POS:.3f} → skip")
-                    continue
-
-                # Rebalance skip band (reduces churn)
                 prev_pos = float(state.get("pos_ema", {}).get(sym, 0.0))
                 if abs(target_frac - prev_pos) < REBALANCE_BAND:
                     print(f"[SKIP] {sym}: |Δtarget|={abs(target_frac - prev_pos):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
@@ -551,7 +536,7 @@ def run_session(api):
                 print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
                 submit_target(api, sym, target_frac, eq, px)
 
-                # >>> AGENT 3.4D BEGIN: hold duration (agent override or fallback)
+                # Hold duration
                 absf = abs(target_frac)
                 if dec.hold_min_blocks is not None:
                     hold_blocks = int(max(1, dec.hold_min_blocks))
@@ -560,7 +545,6 @@ def run_session(api):
                     elif absf < 0.50: hold_blocks = 2
                     else:             hold_blocks = 3
                 state.setdefault("hold_timer", {})[sym] = hold_blocks
-                # >>> AGENT 3.4D END
 
             except Exception as e:
                 print(f"[ERR] {sym}: {e}")
@@ -589,6 +573,9 @@ def run_session(api):
             except Exception:
                 pass
         agent.update_rewards(sym_to_realized)
+        # Persist agent learning each block
+        state["agent"] = agent.export_state()
+        save_state(state)
         # >>> AGENT 3.5 END
 
         print("[EXIT] flattening hour positions...", flush=True)
@@ -635,7 +622,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     except KeyError as e:
-        print(f"[FATAL] missing env var: {e}")
+        print(f"[FATAL] missing env var: {e}")  # <<< fixed formatting
         sys.exit(2)
     except Exception:
         traceback.print_exc()
