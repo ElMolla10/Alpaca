@@ -16,7 +16,7 @@ from alpaca_trade_api.rest import REST, TimeFrame
 
 # === Agentic RL layer ===
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
-from app.execution import BlockLedger  # NEW: fees + slippage-aware reward
+from app.execution import BlockLedger
 
 # =================== CONFIG / ENV ===================
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
