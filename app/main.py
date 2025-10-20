@@ -70,8 +70,11 @@ AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "10"))
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
+# Per-symbol position size multipliers (for future fine-tuning)
+PER_SYMBOL_SIZE_MULT = {}
+
 # =================== SYMBOL UNIVERSE ===================
-universe_path = pathlib.Path("app/data/universe.csv")
+universe_path = pathlib.Path("app/universe.csv")
 if universe_path.exists():
     SYMBOLS = [l.strip().upper() for l in universe_path.read_text().splitlines()[1:] if l.strip()]
     print(f"[INIT] Loaded {len(SYMBOLS)} symbols from universe.csv")
