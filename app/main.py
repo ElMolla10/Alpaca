@@ -265,8 +265,15 @@ with open(FEATS_PATH, "r") as f:
 print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
 
 def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.DataFrame:
+    """
+    Pull last ~30 days of HOURLY bars and (if between 10:00 and <11:00 ET)
+    synthesize a partial 10:00→now bar from minute data so the first block
+    is tradable without waiting for 11:00.
+    """
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=lookback_days)
+
+    # --- fetch hourly bars ---
     try:
         bars = api.get_bars(
             sym, TimeFrame.Hour,
@@ -277,9 +284,11 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
         print(f"[WARN] {sym}: get_bars feed={ALPACA_DATA_FEED} failed: {e}")
         if ALPACA_DATA_FEED.lower() != "iex":
             try:
-                bars = api.get_bars(sym, TimeFrame.Hour,
-                                    start=rfc3339(start_utc), end=rfc3339(now_utc),
-                                    adjustment="raw", limit=1000, feed="iex")
+                bars = api.get_bars(
+                    sym, TimeFrame.Hour,
+                    start=rfc3339(start_utc), end=rfc3339(now_utc),
+                    adjustment="raw", limit=1000, feed="iex"
+                )
                 print(f"[INFO] {sym}: fell back to feed=iex")
             except Exception as e2:
                 print(f"[ERR] {sym}: get_bars failed even with iex: {e2}")
@@ -307,14 +316,66 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
         })
     df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
-    # Filter to 10:00–15:59 ET (match training)
+    # --- OPTIONAL: synthesize partial current-hour bar from minutes (10:00–<11:00 ET) ---
+    try:
+        ny_now = datetime.now(TZ_NY)
+        # Only try to synthesize during the first regular hour of the session
+        if 10 <= ny_now.hour < 11:
+            # Start of the 10:00 ET hour today
+            start_ny = ny_now.replace(hour=10, minute=0, second=0, microsecond=0)
+            start_utc_min = start_ny.astimezone(timezone.utc)
+
+            mins = api.get_bars(
+                sym, TimeFrame.Minute,
+                start=rfc3339(start_utc_min), end=rfc3339(now_utc),
+                adjustment="raw", limit=1000, feed=ALPACA_DATA_FEED
+            )
+
+            if mins:
+                mdf = pd.DataFrame([{
+                    "t": pd.Timestamp(m.t, tz="UTC"),
+                    "o": float(getattr(m, "o", np.nan)),
+                    "h": float(getattr(m, "h", np.nan)),
+                    "l": float(getattr(m, "l", np.nan)),
+                    "c": float(getattr(m, "c", np.nan)),
+                    "v": float(getattr(m, "v", np.nan)),
+                    "vw": float(getattr(m, "vw", np.nan)) if hasattr(m, "vw") else np.nan,
+                } for m in mins])
+
+                if not mdf.empty:
+                    # Aggregate 10:00→now minute bars into a pseudo-hour bar
+                    open_px  = float(mdf["o"].iloc[0])
+                    high_px  = float(mdf["h"].max())
+                    low_px   = float(mdf["l"].min())
+                    close_px = float(mdf["c"].iloc[-1])
+                    vol_sum  = float(mdf["v"].sum())
+                    vwap_w   = float(np.average(
+                        mdf["vw"].fillna(mdf["c"]),
+                        weights=np.clip(mdf["v"], 1e-12, None)
+                    )) if "vw" in mdf else float(mdf["c"].mean())
+
+                    synth_row = {
+                        "timestamp": pd.Timestamp(start_utc_min, tz="UTC"),
+                        "open": open_px, "high": high_px, "low": low_px,
+                        "close": close_px, "volume": vol_sum, "vwap": vwap_w
+                    }
+
+                    # Append only if we don't already have a 10:00 bar today
+                    if not ((df["timestamp"] == synth_row["timestamp"]).any()):
+                        df = pd.concat([df, pd.DataFrame([synth_row])], ignore_index=True)
+                        df = df.sort_values("timestamp").reset_index(drop=True)
+                        print(f"[SYNTH] {sym}: appended partial 10:00→now pseudo-hour bar.")
+    except Exception as _e:
+        print(f"[WARN] {sym}: failed to synthesize partial hour: {_e}")
+
+    # --- Filter to 10:00–15:59 ET (match training) ---
     ts_et = df["timestamp"].dt.tz_convert("America/New_York")
     df = df.loc[ts_et.dt.hour.between(10, 15)].reset_index(drop=True)
     if df.empty:
         print(f"[WARN] {sym}: bars after RTH filter are empty")
         return df
 
-    # Indicators (align to training)
+    # --- Indicators (align to training) ---
     df["price_change_pct"] = df["close"].pct_change() * 100.0
     macd_ind = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
     df["MACDh_12_26_9"] = macd_ind.macd_diff()
@@ -325,7 +386,8 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     df["sigma20_pct"] = df["ret1h_pct"].rolling(20).std().shift(1)
     df["sigma20_pct"] = df["sigma20_pct"].replace(0.0, np.nan)
 
-    base = ["open","high","low","close","volume","vwap","price_change_pct","MACDh_12_26_9","BBM_20_2.0"]
+    base = ["open","high","low","close","volume","vwap",
+            "price_change_pct","MACDh_12_26_9","BBM_20_2.0"]
     for f in base:
         if f not in df.columns:
             df[f] = 0.0
@@ -344,12 +406,14 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
 
     df = df.dropna().reset_index(drop=True)
 
+    # Ensure all FEAT_COLS exist
     for c in FEAT_COLS:
         if c not in df.columns:
             df[c] = 0.0
 
     df = df[["timestamp"] + [c for c in FEAT_COLS if c in df.columns]]
     return df
+
 
 def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
     s = float(pred_pct) / max(1e-12, band_R)
@@ -433,6 +497,9 @@ def run_session(api):
     session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
     block_start   = t_now if t_now >= session_open else session_open
+    
+    if SESSION_START_H < 11:
+        session_open = session_open.replace(hour=11)
 
     b = 0
     while True:
