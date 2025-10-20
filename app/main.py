@@ -6,6 +6,7 @@ import datetime as dt
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import pathlib
+import re
 
 import pytz
 import numpy as np
@@ -198,79 +199,135 @@ def linear_notional_from_posfrac(pos_frac: float) -> float:
 # === DELTA-AWARE TARGETING (replaces old submit_target) ===
 def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedger | None = None):
     """
-    target_pos_frac: desired signed fraction of equity in symbol, [-1..+1].
-    Places only the delta needed to reach target, net of current exposure.
-    Uses notional for longs; for shorts uses integer shares (API constraint).
-    Records approximate fills to ledger for PnL accounting.
+    target_pos_frac: [-1..+1] desired fraction per name (our “position”), signed.
+    Records an approximate fill to the ledger (fees+slippage accounted).
+    Retries shorts on borrow/availability limits; falls back qty if notional fails.
     """
-    def _round_cents(x: float) -> float:
+    def _round_to_cents(x: float) -> float:
         return float(Decimal(str(max(0.0, x))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
     try:
+        # Policy gates
         if LONGS_ONLY and target_pos_frac < 0:
             print(f"[LONGS_ONLY] {sym}: short target blocked.")
             return
 
-        cur_qty = 0.0
-        cur_mv  = 0.0
-        try:
-            p = api.get_position(sym)
-            cur_qty = float(p.qty)
-            cur_mv  = float(p.market_value)
-        except Exception:
-            pass
-
-        cur_frac = 0.0 if equity <= 0 else (cur_mv / equity)
-        delta_frac = float(target_pos_frac) - cur_frac
-        if abs(delta_frac) < REBALANCE_BAND:
-            print(f"[SKIP] {sym}: |Δfrac|={abs(delta_frac):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
+        pos_frac = float(target_pos_frac)
+        if abs(pos_frac) < MIN_ABS_POS:
+            print(f"[SKIP] {sym}: |pos|={abs(pos_frac):.3f} < MIN_ABS_POS={MIN_ABS_POS:.3f}")
             return
 
-        tgt_notional_mag = linear_notional_from_posfrac(delta_frac)
-        side = "buy" if delta_frac > 0 else "sell"
+        if pos_frac < 0 and not SHORTS_ENABLED:
+            print(f"[SKIP] {sym}: shorts disabled")
+            return
 
+        # Linear sizing from |pos_frac|
+        tgt_notional = linear_notional_from_posfrac(pos_frac)
+
+        side = "buy" if pos_frac > 0 else "sell"
+        signed_notional = tgt_notional if pos_frac > 0 else -tgt_notional
+
+        # Leverage headroom guard
         gross, limit = gross_exposure_and_limit(api)
-        headroom = _round_cents(max(0.0, limit - gross))
+        headroom = _round_to_cents(max(0.0, limit - gross))
         if headroom <= 1.00:
-            print(f"[GUARD] gross {gross:,.2f}≈limit {limit:,.2f}; skip {sym}")
+            print(f"[GUARD] gross {gross:,.2f} ≈ limit {limit:,.2f}; skip {sym}")
+            return
+        if abs(signed_notional) > headroom:
+            print(f"[CLIP] {sym}: clip {abs(signed_notional):,.2f} → {headroom:,.2f} by leverage guard")
+            signed_notional = math.copysign(headroom, signed_notional)
+
+        # ----- SHORT / SELL (qty path with availability-aware retry) -----
+        if side == "sell" and SHORTS_ENABLED:
+            if last_px is None or last_px <= 0 or math.isnan(last_px):
+                print(f"[SKIP] {sym}: invalid price for short")
+                return
+
+            qty_int = int(abs(signed_notional) / last_px)
+            if qty_int <= 0:
+                print(f"[SKIP] {sym}: short qty rounds to 0")
+                return
+
+            print(f"[ORDER] {sym} SELL qty={qty_int} (~${qty_int*last_px:,.2f}) |pos|={abs(pos_frac):.3f}")
+            try:
+                api.submit_order(symbol=sym, qty=qty_int, side="sell", type="market", time_in_force="day")
+                if ledger is not None:
+                    ledger.record_fill(sym, side="sell", qty=qty_int, price=last_px)
+                return
+            except Exception as e:
+                msg = str(e)
+                # Try to parse "available: N" and clip
+                m = re.search(r"available:\s*([\d\.]+)", msg.lower())
+                if m:
+                    avail = int(float(m.group(1)))
+                    if avail > 0:
+                        print(f"[RETRY] {sym}: clipping short qty {qty_int}→{avail} due to availability")
+                        api.submit_order(symbol=sym, qty=avail, side="sell", type="market", time_in_force="day")
+                        if ledger is not None:
+                            ledger.record_fill(sym, side="sell", qty=avail, price=last_px)
+                        return
+                    else:
+                        print(f"[SKIP] {sym}: no borrow available")
+                        return
+                # Fallback: halve and retry once
+                clipped = max(1, qty_int // 2)
+                if clipped < qty_int:
+                    print(f"[RETRY] {sym}: halve qty {qty_int}→{clipped}")
+                    try:
+                        api.submit_order(symbol=sym, qty=clipped, side="sell", type="market", time_in_force="day")
+                        if ledger is not None:
+                            ledger.record_fill(sym, side="sell", qty=clipped, price=last_px)
+                        return
+                    except Exception as e2:
+                        print(f"[ORDER_ERR] {sym}: retry failed: {e2}")
+                        return
+                print(f"[ORDER_ERR] {sym}: {e}")
+                return
+
+        # ----- LONG / BUY (prefer notional; fall back to qty if needed) -----
+        notional_abs = _round_to_cents(abs(signed_notional))
+        if notional_abs < 1.00:
+            print(f"[SKIP] {sym}: notional too small")
             return
 
-        per_sym_cap = PER_SYM_GROSS_CAP * equity
-        post_abs_mv = abs(cur_mv + (tgt_notional_mag if delta_frac > 0 else -tgt_notional_mag))
-        if post_abs_mv > per_sym_cap:
-            clip_to = max(0.0, per_sym_cap - abs(cur_mv))
-            if clip_to < 1.00:
-                print(f"[CAP] {sym}: per-sym cap hit; skip (cur={abs(cur_mv):,.2f} cap={per_sym_cap:,.2f})")
-                return
-            print(f"[CAP] {sym}: clip notional {tgt_notional_mag:,.2f}→{clip_to:,.2f}")
-            tgt_notional_mag = clip_to
+        print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} |pos|={abs(pos_frac):.3f}")
 
-        if tgt_notional_mag > headroom:
-            print(f"[CLIP] {sym}: leverage headroom {headroom:,.2f} < need {tgt_notional_mag:,.2f}")
-            tgt_notional_mag = headroom
-
-        if delta_frac < 0 and SHORTS_ENABLED:
-            if not last_px or not np.isfinite(last_px) or last_px <= 0:
-                print(f"[SKIP] {sym}: invalid price for short/cover")
+        if USE_NOTIONAL_ORDERS:
+            try:
+                api.submit_order(symbol=sym, notional=notional_abs, side=side, type="market", time_in_force="day")
+                if ledger is not None and last_px and last_px > 0 and not math.isnan(last_px):
+                    qty_est = notional_abs / last_px
+                    ledger.record_fill(sym, side=side, qty=qty_est, price=last_px)
                 return
-            qty = int(tgt_notional_mag / last_px)
-            if qty <= 0:
-                print(f"[SKIP] {sym}: qty rounds to 0")
-                return
-            print(f"[ORDER] {sym} {side.upper()} qty={qty} (~${qty*last_px:,.2f}) Δfrac={delta_frac:+.3f}")
-            api.submit_order(symbol=sym, qty=qty, side=side, type="market", time_in_force="day")
-            if ledger is not None:
-                ledger.record_fill(sym, side=side, qty=qty, price=last_px)
+            except Exception as e:
+                # Fallback to integer qty if broker rejects notional
+                if last_px and last_px > 0 and not math.isnan(last_px):
+                    qty_int = max(1, int(notional_abs / last_px))
+                    print(f"[FALLBACK] {sym}: switching to qty order qty={qty_int} after notional error: {e}")
+                    try:
+                        api.submit_order(symbol=sym, qty=qty_int, side=side, type="market", time_in_force="day")
+                        if ledger is not None:
+                            ledger.record_fill(sym, side=side, qty=qty_int, price=last_px)
+                        return
+                    except Exception as e2:
+                        print(f"[ORDER_ERR] {sym}: qty fallback failed: {e2}")
+                        return
+                else:
+                    print(f"[ORDER_ERR] {sym}: notional submit failed and no valid price: {e}")
+                    return
         else:
-            notional_abs = _round_cents(tgt_notional_mag)
-            if notional_abs < 1.00:
-                print(f"[SKIP] {sym}: notional too small")
-                return
-            print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} Δfrac={delta_frac:+.3f}")
-            api.submit_order(symbol=sym, notional=notional_abs, side=side, type="market", time_in_force="day")
-            if ledger is not None and last_px and last_px > 0 and np.isfinite(last_px):
-                qty_est = notional_abs / last_px
-                ledger.record_fill(sym, side=side, qty=qty_est, price=last_px)
+            # Direct qty route if not using notionals
+            if last_px and last_px > 0 and not math.isnan(last_px):
+                qty_int = max(1, int(notional_abs / last_px))
+                print(f"[ORDER] {sym} {side.upper()} qty={qty_int} (~${qty_int*last_px:,.2f})")
+                try:
+                    api.submit_order(symbol=sym, qty=qty_int, side=side, type="market", time_in_force="day")
+                    if ledger is not None:
+                        ledger.record_fill(sym, side=side, qty=qty_int, price=last_px)
+                except Exception as e:
+                    print(f"[ORDER_ERR] {sym}: {e}")
+            else:
+                print(f"[SKIP] {sym}: invalid price for qty path")
 
     except Exception as e:
         print(f"[ORDER_ERR] {sym}: {e}")
