@@ -1,0 +1,7 @@
+import pathlib
+universe_path = pathlib.Path("app/data/universe.csv")
+if universe_path.exists():
+    SYMBOLS = [l.strip().upper() for l in universe_path.read_text().splitlines()[1:] if l.strip()]
+else:
+    symbols_env = os.environ.get("SYMBOLS", "AAPL,MSFT,NVDA,AMD,JPM,GS,XOM,CVX,PG,KO")
+    SYMBOLS = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
