@@ -13,6 +13,8 @@ import xgboost as xgb
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
+from dotenv import load_dotenv
+load_dotenv()
 
 # === Agentic RL layer ===
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
