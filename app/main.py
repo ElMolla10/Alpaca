@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # app/main.py
 
-import os, sys, time, math, json, traceback, tempfile
+import os, sys, time, math, json, traceback
 import datetime as dt
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
+import pathlib
 
 import pytz
 import numpy as np
@@ -14,6 +15,8 @@ from ta.trend import MACD
 from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
 from dotenv import load_dotenv
+
+# Load .env variables early
 load_dotenv()
 
 # === Agentic RL layer ===
@@ -29,26 +32,26 @@ KEY_ID   = os.environ["APCA_API_KEY_ID"]
 SECRET   = os.environ["APCA_API_SECRET_KEY"]
 
 # Market session
-SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET (matches feature filter)
+SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET
 TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))
 
-# Model / policy
+# Model / policy parameters
 PRIMARY_H          = int(os.environ.get("PRIMARY_H", "1"))
-BAND_R             = float(os.environ.get("BAND_R", "1.10"))
+BAND_R             = float(os.environ.get("BAND_R", "0.35"))
 POS_EXP            = float(os.environ.get("POS_EXP", "1.5"))
 EMA_HALF_LIFE      = int(os.environ.get("EMA_HL", "6"))
 DPOS_CAP           = float(os.environ.get("DPOS_CAP", "0.10"))
 MAX_POS            = float(os.environ.get("MAX_POS", "0.75"))
 MIN_ABS_POS        = float(os.environ.get("MIN_ABS_POS", "0.02"))
 USE_EQUITY_SIZING  = os.environ.get("USE_EQUITY_SIZING", "1") == "1"
-PER_SYM_GROSS_CAP  = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))  # as fraction of equity (abs gross per name)
+PER_SYM_GROSS_CAP  = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))
 BASE_NOTIONAL_PER_TRADE = float(os.environ.get("BASE_NOTIONAL_PER_TRADE", "3000"))
 MAX_NOTIONAL       = float(os.environ.get("MAX_NOTIONAL", "10000"))
 PER_TRADE_NOTIONAL_CAP_F = float(os.environ.get("PER_TRADE_NOTIONAL_CAP_F", "0.75"))
 USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
 SHORTS_ENABLED     = os.environ.get("SHORTS_ENABLED", "1") == "1"
 LONGS_ONLY         = os.environ.get("LONGS_ONLY", "0") == "1"
-SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.5"))
+SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.0"))
 REBALANCE_BAND     = float(os.environ.get("REBALANCE_BAND", "0.01"))
 
 # Friday rules
@@ -61,17 +64,23 @@ FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
-AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "8"))
+AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "10"))
 
 # Trading costs (BPS)
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
 SLIP_BPS       = float(os.environ.get("SLIPPAGE_BPS", "4.0"))
 
-# Symbols
-TEST_MODE  = os.environ.get("TEST_MODE", "0") == "1"
-symbols_env = os.environ.get("SYMBOLS", "AAPL,MSFT,NVDA,AMD,JPM,GS,XOM,CVX,PG,KO")
-SYMBOLS = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
-print(f"[INIT] SYMBOLS={SYMBOLS}")
+# =================== SYMBOL UNIVERSE ===================
+universe_path = pathlib.Path("app/data/universe.csv")
+if universe_path.exists():
+    SYMBOLS = [l.strip().upper() for l in universe_path.read_text().splitlines()[1:] if l.strip()]
+    print(f"[INIT] Loaded {len(SYMBOLS)} symbols from universe.csv")
+else:
+    symbols_env = os.environ.get("SYMBOLS", "AAPL,MSFT,NVDA,AMD,JPM,GS,XOM,CVX,PG,KO")
+    SYMBOLS = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+    print(f"[INIT] Fallback SYMBOLS={SYMBOLS}")
+
+print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 
 # Model & features
 MODEL_PATH = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
@@ -79,16 +88,10 @@ FEATS_PATH = os.environ.get("FEATS_PATH", "app/feat_cols.json")
 
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
-print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
+print(f"[INIT] loaded feature set from {FEATS_PATH}")
 
-# Persist state (cross-platform)
-STATE_PATH = os.environ.get(
-    "STATE_PATH",
-    os.path.join(tempfile.gettempdir(), "live_state.json")
-)
-
-# Per-symbol size multipliers (optional tuning)
-PER_SYMBOL_SIZE_MULT = {sym: 1.0 for sym in SYMBOLS}
+# Persisted state
+STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
 
 # =================== UTILS ===================
 def rfc3339(dtobj: datetime) -> str:
