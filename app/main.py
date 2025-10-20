@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # app/main.py
 
-import os, sys, time, math, json, traceback
+import os, sys, time, math, json, traceback, tempfile
 import datetime as dt
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -27,7 +27,7 @@ KEY_ID   = os.environ["APCA_API_KEY_ID"]
 SECRET   = os.environ["APCA_API_SECRET_KEY"]
 
 # Market session
-SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET
+SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET (matches feature filter)
 TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOSE", "30"))
 
 # Model / policy
@@ -39,7 +39,7 @@ DPOS_CAP           = float(os.environ.get("DPOS_CAP", "0.10"))
 MAX_POS            = float(os.environ.get("MAX_POS", "0.75"))
 MIN_ABS_POS        = float(os.environ.get("MIN_ABS_POS", "0.02"))
 USE_EQUITY_SIZING  = os.environ.get("USE_EQUITY_SIZING", "1") == "1"
-PER_SYM_GROSS_CAP  = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))
+PER_SYM_GROSS_CAP  = float(os.environ.get("PER_SYM_GROSS_CAP", "0.05"))  # as fraction of equity (abs gross per name)
 BASE_NOTIONAL_PER_TRADE = float(os.environ.get("BASE_NOTIONAL_PER_TRADE", "3000"))
 MAX_NOTIONAL       = float(os.environ.get("MAX_NOTIONAL", "10000"))
 PER_TRADE_NOTIONAL_CAP_F = float(os.environ.get("PER_TRADE_NOTIONAL_CAP_F", "0.75"))
@@ -79,8 +79,11 @@ booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
 print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 
-# Persist state
-STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
+# Persist state (cross-platform)
+STATE_PATH = os.environ.get(
+    "STATE_PATH",
+    os.path.join(tempfile.gettempdir(), "live_state.json")
+)
 
 # Per-symbol size multipliers (optional tuning)
 PER_SYMBOL_SIZE_MULT = {sym: 1.0 for sym in SYMBOLS}
@@ -116,21 +119,15 @@ def save_state(st):
         pass
 
 def ensure_market_open_or_wait(api):
-    clock = api.get_clock()
-    if getattr(clock, "is_open", False):
-        print("[INFO] Market is open. Starting trading immediately.")
-        return
-    ny = TZ_NY
-    open_time_ny = clock.next_open.astimezone(ny)
-    now_ny_ = dt.datetime.now(ny)
-    wait_sec = max(0, (open_time_ny - now_ny_).total_seconds())
-    hrs = wait_sec / 3600.0
-    print(f"[WAIT] Market closed. Waiting {hrs:.2f} hours until next open ({open_time_ny}).")
-    while wait_sec > 0:
-        chunk = min(900, wait_sec)
-        time.sleep(chunk)
-        wait_sec -= chunk
-    print("[INFO] Market is now open. Starting session.")
+    # Keep as a lightweight logger (main() already waits when closed)
+    try:
+        clock = api.get_clock()
+        if getattr(clock, "is_open", False):
+            print("[INFO] Market is open. Starting trading immediately.")
+        else:
+            print("[WAIT] Market closed. main() will handle wait.")
+    except Exception as e:
+        print(f"[WARN] ensure_market_open_or_wait: {e}")
 
 # =================== ALPACA HELPERS ===================
 def latest_price(api, sym):
@@ -196,63 +193,90 @@ def linear_notional_from_posfrac(pos_frac: float) -> float:
     raw = BASE_NOTIONAL_PER_TRADE + (MAX_NOTIONAL - BASE_NOTIONAL_PER_TRADE) * mag
     return float(min(MAX_NOTIONAL, max(BASE_NOTIONAL_PER_TRADE, raw)))
 
+# === DELTA-AWARE TARGETING (replaces old submit_target) ===
 def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedger | None = None):
     """
-    target_pos_frac: [-1..+1] desired fraction per name (our “position”), signed.
-    Records an approximate fill to the ledger (fees+slippage accounted).
+    target_pos_frac: desired signed fraction of equity in symbol, [-1..+1].
+    Places only the delta needed to reach target, net of current exposure.
+    Uses notional for longs; for shorts uses integer shares (API constraint).
+    Records approximate fills to ledger for PnL accounting.
     """
-    def _round_to_cents(x: float) -> float:
+    def _round_cents(x: float) -> float:
         return float(Decimal(str(max(0.0, x))).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
     try:
+        # Guards
         if LONGS_ONLY and target_pos_frac < 0:
             print(f"[LONGS_ONLY] {sym}: short target blocked.")
             return
+        if abs(target_pos_frac) < MIN_ABS_POS:
+            print(f"[SKIP] {sym}: |target|<{MIN_ABS_POS:.3f}")
+            target_pos_frac = 0.0  # treat as flat target
 
-        pos_frac = float(target_pos_frac)
-        if abs(pos_frac) < MIN_ABS_POS:
-            print(f"[SKIP] {sym}: |pos|={abs(pos_frac):.3f} < MIN_ABS_POS={MIN_ABS_POS:.3f}")
+        # Current exposure (signed notional)
+        cur_qty = 0.0
+        cur_mv  = 0.0
+        try:
+            p = api.get_position(sym)
+            cur_qty = float(p.qty)
+            cur_mv  = float(p.market_value)  # signed by Alpaca (neg for shorts)
+        except Exception:
+            pass
+
+        cur_frac = 0.0 if equity <= 0 else (cur_mv / equity)
+        delta_frac = float(target_pos_frac) - cur_frac
+        if abs(delta_frac) < REBALANCE_BAND:
+            print(f"[SKIP] {sym}: |Δfrac|={abs(delta_frac):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
             return
 
-        if pos_frac < 0 and not SHORTS_ENABLED:
-            print(f"[SKIP] {sym}: shorts disabled")
-            return
+        # Size curve on the delta only
+        tgt_notional_mag = linear_notional_from_posfrac(delta_frac)
+        side = "buy" if delta_frac > 0 else "sell"
 
-        tgt_notional = linear_notional_from_posfrac(pos_frac)
-
-        side = "buy" if pos_frac > 0 else "sell"
-        signed_notional = tgt_notional if pos_frac > 0 else -tgt_notional
-
+        # Account-level leverage guard
         gross, limit = gross_exposure_and_limit(api)
-        headroom = _round_to_cents(max(0.0, limit - gross))
+        headroom = _round_cents(max(0.0, limit - gross))
         if headroom <= 1.00:
-            print(f"[GUARD] gross {gross:,.2f} ≈ limit {limit:,.2f}; skip {sym}")
+            print(f"[GUARD] gross {gross:,.2f}≈limit {limit:,.2f}; skip {sym}")
             return
-        if abs(signed_notional) > headroom:
-            print(f"[CLIP] {sym}: clip {abs(signed_notional):, .2f} → {headroom:,.2f} by leverage guard")
-            signed_notional = math.copysign(headroom, signed_notional)
 
-        if side == "sell" and SHORTS_ENABLED:
-            if last_px is None or last_px <= 0 or math.isnan(last_px):
-                print(f"[SKIP] {sym}: invalid price for short")
+        # Per-symbol absolute gross cap after the trade
+        per_sym_cap = PER_SYM_GROSS_CAP * equity
+        post_abs_mv = abs(cur_mv + (tgt_notional_mag if delta_frac > 0 else -tgt_notional_mag))
+        if post_abs_mv > per_sym_cap:
+            clip_to = max(0.0, per_sym_cap - abs(cur_mv))
+            if clip_to < 1.00:
+                print(f"[CAP] {sym}: per-sym cap hit; skip (cur={abs(cur_mv):,.2f} cap={per_sym_cap:,.2f})")
                 return
-            qty_int = int(abs(signed_notional) / last_px)
-            if qty_int <= 0:
-                print(f"[SKIP] {sym}: short qty rounds to 0")
+            print(f"[CAP] {sym}: clip notional {tgt_notional_mag:,.2f}→{clip_to:,.2f}")
+            tgt_notional_mag = clip_to
+
+        # Final leverage cap
+        if tgt_notional_mag > headroom:
+            print(f"[CLIP] {sym}: leverage headroom {headroom:,.2f} < need {tgt_notional_mag:,.2f}")
+            tgt_notional_mag = headroom
+
+        # Execute
+        if delta_frac < 0 and SHORTS_ENABLED:
+            if not last_px or not np.isfinite(last_px) or last_px <= 0:
+                print(f"[SKIP] {sym}: invalid price for short/cover")
                 return
-            print(f"[ORDER] {sym} SELL qty={qty_int} (~${qty_int*last_px:,.2f}) |pos|={abs(pos_frac):.3f}")
-            api.submit_order(symbol=sym, qty=qty_int, side="sell", type="market", time_in_force="day")
-            # Approx fill record (short open/extend)
+            qty = int(tgt_notional_mag / last_px)
+            if qty <= 0:
+                print(f"[SKIP] {sym}: qty rounds to 0")
+                return
+            print(f"[ORDER] {sym} {side.upper()} qty={qty} (~${qty*last_px:,.2f}) Δfrac={delta_frac:+.3f}")
+            api.submit_order(symbol=sym, qty=qty, side=side, type="market", time_in_force="day")
             if ledger is not None:
-                ledger.record_fill(sym, side="sell", qty=qty_int, price=last_px)
+                ledger.record_fill(sym, side=side, qty=qty, price=last_px)
         else:
-            notional_abs = _round_to_cents(abs(signed_notional))
+            notional_abs = _round_cents(tgt_notional_mag)
             if notional_abs < 1.00:
                 print(f"[SKIP] {sym}: notional too small")
                 return
-            print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} |pos|={abs(pos_frac):.3f}")
+            print(f"[ORDER] {sym} {side.upper()} notional ${notional_abs:,.2f} Δfrac={delta_frac:+.3f}")
             api.submit_order(symbol=sym, notional=notional_abs, side=side, type="market", time_in_force="day")
-            # Approx fill record (long open/extend) — estimate qty from notional/price
-            if ledger is not None and last_px and last_px > 0 and not math.isnan(last_px):
+            if ledger is not None and last_px and last_px > 0 and np.isfinite(last_px):
                 qty_est = notional_abs / last_px
                 ledger.record_fill(sym, side=side, qty=qty_est, price=last_px)
 
@@ -263,6 +287,14 @@ def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedge
 with open(FEATS_PATH, "r") as f:
     FEAT_COLS = json.load(f)
 print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
+print(f"[PARITY] FEAT_COLS={len(FEAT_COLS)} window=10:00–15:59 ET, horizon={PRIMARY_H}h, band_R={BAND_R}")
+
+def _ts_to_utc(ts_any) -> pd.Timestamp:
+    """Robustly coerce any alpaca timestamp-like to UTC-aware pandas Timestamp."""
+    ts = pd.Timestamp(getattr(ts_any, "t", None) or getattr(ts_any, "Timestamp", None) or ts_any)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.DataFrame:
     """
@@ -302,9 +334,7 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
 
     rows = []
     for b in bars:
-        ts = b.t if isinstance(b.t, datetime) else pd.to_datetime(b.t, utc=True)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
+        ts = _ts_to_utc(b)
         rows.append({
             "timestamp": ts,
             "open": float(getattr(b, "o", np.nan)),
@@ -319,9 +349,7 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     # --- OPTIONAL: synthesize partial current-hour bar from minutes (10:00–<11:00 ET) ---
     try:
         ny_now = datetime.now(TZ_NY)
-        # Only try to synthesize during the first regular hour of the session
         if 10 <= ny_now.hour < 11:
-            # Start of the 10:00 ET hour today
             start_ny = ny_now.replace(hour=10, minute=0, second=0, microsecond=0)
             start_utc_min = start_ny.astimezone(timezone.utc)
 
@@ -332,39 +360,46 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
             )
 
             if mins:
-                mdf = pd.DataFrame([{
-                    "t": pd.Timestamp(m.t, tz="UTC"),
-                    "o": float(getattr(m, "o", np.nan)),
-                    "h": float(getattr(m, "h", np.nan)),
-                    "l": float(getattr(m, "l", np.nan)),
-                    "c": float(getattr(m, "c", np.nan)),
-                    "v": float(getattr(m, "v", np.nan)),
-                    "vw": float(getattr(m, "vw", np.nan)) if hasattr(m, "vw") else np.nan,
-                } for m in mins])
-
+                rows_m = []
+                for m in mins:
+                    ts_m = _ts_to_utc(m)
+                    rows_m.append({
+                        "t": ts_m,
+                        "o": float(getattr(m, "o", np.nan)),
+                        "h": float(getattr(m, "h", np.nan)),
+                        "l": float(getattr(m, "l", np.nan)),
+                        "c": float(getattr(m, "c", np.nan)),
+                        "v": float(getattr(m, "v", np.nan)),
+                        "vw": float(getattr(m, "vw", np.nan)) if hasattr(m, "vw") else np.nan,
+                    })
+                mdf = pd.DataFrame(rows_m)
                 if not mdf.empty:
-                    # Aggregate 10:00→now minute bars into a pseudo-hour bar
-                    open_px  = float(mdf["o"].iloc[0])
-                    high_px  = float(mdf["h"].max())
-                    low_px   = float(mdf["l"].min())
-                    close_px = float(mdf["c"].iloc[-1])
-                    vol_sum  = float(mdf["v"].sum())
-                    vwap_w   = float(np.average(
-                        mdf["vw"].fillna(mdf["c"]),
-                        weights=np.clip(mdf["v"], 1e-12, None)
-                    )) if "vw" in mdf else float(mdf["c"].mean())
+                    # clip to [10:00, now] UTC defensively
+                    mdf = mdf[(mdf["t"] >= pd.Timestamp(start_utc_min)) & (mdf["t"] <= pd.Timestamp(now_utc))]
+                    if not mdf.empty:
+                        open_px  = float(mdf["o"].iloc[0])
+                        high_px  = float(mdf["h"].max())
+                        low_px   = float(mdf["l"].min())
+                        close_px = float(mdf["c"].iloc[-1])
+                        vol_sum  = float(mdf["v"].sum())
+                        if "vw" in mdf:
+                            vwap_w = float(np.average(
+                                mdf["vw"].fillna(mdf["c"]),
+                                weights=np.clip(mdf["v"], 1e-12, None)
+                            ))
+                        else:
+                            vwap_w = float(mdf["c"].mean())
 
-                    synth_row = {
-                        "timestamp": pd.Timestamp(start_utc_min, tz="UTC"),
-                        "open": open_px, "high": high_px, "low": low_px,
-                        "close": close_px, "volume": vol_sum, "vwap": vwap_w
-                    }
+                        synth_row = {
+                            "timestamp": pd.Timestamp(start_utc_min, tz="UTC"),
+                            "open": open_px, "high": high_px, "low": low_px,
+                            "close": close_px, "volume": vol_sum, "vwap": vwap_w
+                        }
 
-                    # Append only if we don't already have a 10:00 bar today
-                    if not ((df["timestamp"] == synth_row["timestamp"]).any()):
-                        df = pd.concat([df, pd.DataFrame([synth_row])], ignore_index=True)
-                        df = df.sort_values("timestamp").reset_index(drop=True)
-                        print(f"[SYNTH] {sym}: appended partial 10:00→now pseudo-hour bar.")
+                        if not ((df["timestamp"] == synth_row["timestamp"]).any()):
+                            df = pd.concat([df, pd.DataFrame([synth_row])], ignore_index=True)
+                            df = df.sort_values("timestamp").reset_index(drop=True)
+                            print(f"[SYNTH] {sym}: appended partial 10:00→now pseudo-hour bar.")
     except Exception as _e:
         print(f"[WARN] {sym}: failed to synthesize partial hour: {_e}")
 
@@ -497,9 +532,6 @@ def run_session(api):
     session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
     block_start   = t_now if t_now >= session_open else session_open
-    
-    if SESSION_START_H < 11:
-        session_open = session_open.replace(hour=11)
 
     b = 0
     while True:
@@ -507,7 +539,7 @@ def run_session(api):
             print("[INFO] Reached session close window; stopping.")
             break
 
-        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)  # NEW: per-block fees+slippage accounting
+        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)  # per-block fees+slippage accounting
 
         unclamped_end = block_start + dt.timedelta(hours=1)
         block_end = min(unclamped_end, session_close)
@@ -528,9 +560,6 @@ def run_session(api):
             friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
             print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
 
-        minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
-        cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
-
         # >>> AGENT 3.3 BEGIN
         sym_to_df = {}
         for s in SYMBOLS:
@@ -543,8 +572,15 @@ def run_session(api):
         print(f"[AGENT] universe this block: {sorted(list(trade_universe))}")
         # >>> AGENT 3.3 END
 
+        # price cache within block
+        price_cache = {}
+
         for sym in SYMBOLS:
             try:
+                # recompute minutes_to_close per symbol to keep cutoff fresh
+                minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
+                cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
+
                 rem = int(state.get("hold_timer", {}).get(sym, 0))
                 if rem > 0:
                     print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
@@ -565,16 +601,16 @@ def run_session(api):
                     print(f"[AGENT] {sym}: decision=blocked")
                     continue
 
-                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and rem == 0:
-                    print(f"[FRIDAY] {sym}: after {FRIDAY_LATE_CUTOFF_H}:00 ET → blocking NEW entry.")
-                    continue
-
                 if cutoff_active and rem == 0:
                     print(f"[CUTOFF] {sym}: {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min to close → blocking NEW entry.")
                     continue
 
+                # prediction
                 print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-                px   = latest_price(api, sym)
+                px = price_cache.get(sym)
+                if px is None:
+                    px = latest_price(api, sym)
+                    price_cache[sym] = px
                 pred = predict_block_return_pct(api, sym)  # % for next 1h
                 if pred == 0.0:
                     print(f"[WARN] {sym}: prediction is 0.0 (check features)")
@@ -597,12 +633,22 @@ def run_session(api):
                     target_frac *= friday_mult
                     print(f"[FRIDAY] {sym}: size×={friday_mult:.2f} → target_pos={target_frac:+.3f}")
 
+                # per-symbol cap as fraction guard before order
+                per_sym_cap_frac = max(1e-9, PER_SYM_GROSS_CAP)
+                if abs(target_frac) > per_sym_cap_frac:
+                    target_frac = math.copysign(per_sym_cap_frac, target_frac)
+                    print(f"[CAP] {sym}: target clipped to per-sym cap frac={per_sym_cap_frac:.3f}")
+
                 prev_pos = float(state.get("pos_ema", {}).get(sym, 0.0))
-                if abs(target_frac - prev_pos) < REBALANCE_BAND:
-                    print(f"[SKIP] {sym}: |Δtarget|={abs(target_frac - prev_pos):.3f} < REBALANCE_BAND={REBALANCE_BAND:.3f}")
+                # Friday late: block NEW entries only, still allow reduces
+                is_new_entry = (abs(prev_pos) < MIN_ABS_POS) and (abs(target_frac) >= MIN_ABS_POS)
+                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and is_new_entry:
+                    print(f"[FRIDAY] {sym}: blocking NEW entry after {FRIDAY_LATE_CUTOFF_H}:00 ET.")
                     continue
 
-                print(f"[PLAN] {sym}: px={px:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                px_print = px if (px and np.isfinite(px)) else float("nan")
+                print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+
                 submit_target(api, sym, target_frac, eq, px, ledger=ledger)
 
                 absf = abs(target_frac)
