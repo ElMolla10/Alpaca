@@ -18,8 +18,8 @@ class UserStyle:
     name: str
     # Universe building
     lookback_days: int = 30
-    max_symbols: int = 8
-    min_liquidity_pctile: float = 20.0  # filter out illiquid tails
+    max_symbols: int = 10
+    min_liquidity_pctile: float = 5.0  # filter out illiquid tails
     # Trading preferences
     prefer_momentum: bool = True
     prefer_mean_reversion: bool = False
@@ -118,7 +118,7 @@ class ARLAgent:
         self._eps_decay: float = 0.995
 
         # Filters
-        self._min_sigma_pct: float = 0.20
+        self._min_sigma_pct: float = 0.05
         self._liquidity_floor_prctile: float = style.min_liquidity_pctile
 
         if isinstance(persisted, dict) and persisted:
