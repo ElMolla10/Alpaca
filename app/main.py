@@ -34,7 +34,7 @@ TRADE_CUTOFF_MIN_BEFORE_CLOSE = int(os.environ.get("TRADE_CUTOFF_MIN_BEFORE_CLOS
 PRIMARY_H          = int(os.environ.get("PRIMARY_H", "1"))
 BAND_R             = float(os.environ.get("BAND_R", "1.10"))
 POS_EXP            = float(os.environ.get("POS_EXP", "1.5"))
-EMA_HALF_LIFE      = int(os.environ.get("EMA_HL", "8"))
+EMA_HALF_LIFE      = int(os.environ.get("EMA_HL", "6"))
 DPOS_CAP           = float(os.environ.get("DPOS_CAP", "0.10"))
 MAX_POS            = float(os.environ.get("MAX_POS", "0.75"))
 MIN_ABS_POS        = float(os.environ.get("MIN_ABS_POS", "0.02"))
@@ -46,8 +46,8 @@ PER_TRADE_NOTIONAL_CAP_F = float(os.environ.get("PER_TRADE_NOTIONAL_CAP_F", "0.7
 USE_NOTIONAL_ORDERS = os.environ.get("USE_NOTIONAL_ORDERS", "1") == "1"
 SHORTS_ENABLED     = os.environ.get("SHORTS_ENABLED", "1") == "1"
 LONGS_ONLY         = os.environ.get("LONGS_ONLY", "0") == "1"
-SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.0"))
-REBALANCE_BAND     = float(os.environ.get("REBALANCE_BAND", "0.03"))
+SIGN_MULT          = float(os.environ.get("SIGN_MULT", "1.5"))
+REBALANCE_BAND     = float(os.environ.get("REBALANCE_BAND", "0.01"))
 
 # Friday rules
 FRIDAY_LATE_CUTOFF_H         = int(os.environ.get("FRIDAY_LATE_CUTOFF_H", "14"))
@@ -202,9 +202,6 @@ def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedge
         if LONGS_ONLY and target_pos_frac < 0:
             print(f"[LONGS_ONLY] {sym}: short target blocked.")
             return
-        if abs(target_pos_frac) < MIN_ABS_POS:
-            print(f"[SKIP] {sym}: |target|<{MIN_ABS_POS:.3f}")
-            target_pos_frac = 0.0
 
         cur_qty = 0.0
         cur_mv  = 0.0
@@ -459,8 +456,6 @@ def target_position_from_pred(pred_pct_live: float, band_R: float, hl: int, sym:
     if   delta >  DPOS_CAP: pos = prev + DPOS_CAP
     elif delta < -DPOS_CAP: pos = prev - DPOS_CAP
     pos = max(-MAX_POS, min(MAX_POS, pos))
-    if abs(pos) < MIN_ABS_POS:
-        pos = 0.0
     state["pos_ema"][sym] = pos
     return pos
 
