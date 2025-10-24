@@ -57,8 +57,8 @@ REBALANCE_BAND     = float(os.environ.get("REBALANCE_BAND", "0.01"))
 
 # Friday rules
 FRIDAY_LATE_CUTOFF_H         = int(os.environ.get("FRIDAY_LATE_CUTOFF_H", "14"))
-FRIDAY_SIZE_MULT_DAY         = float(os.environ.get("FRIDAY_SIZE_MULT_DAY", "0.75"))
-FRIDAY_SIZE_MULT_LATE        = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.50"))
+FRIDAY_SIZE_MULT_DAY         = float(os.environ.get("FRIDAY_SIZE_MULT_DAY", "0.85"))
+FRIDAY_SIZE_MULT_LATE        = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.60"))
 FRIDAY_BLOCK_NEW_AFTER_LATE  = os.environ.get("FRIDAY_BLOCK_NEW_AFTER_LATE", "1") == "1"
 FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))
 
