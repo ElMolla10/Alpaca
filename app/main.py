@@ -590,44 +590,44 @@ def run_session(api):
 
     b = 0
     while True:
-    if block_start >= session_close:
-        print("[INFO] Reached session close window; stopping.")
-        break
+        if block_start >= session_close:
+            print("[INFO] Reached session close window; stopping.")
+            break
 
-    # --- EOD: flatten all open trades EOD_FLATTEN_MIN_BEFORE_CLOSE minutes before regular close ---
-    mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
-    if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
-        print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
-        try:
-            # Close broker-side positions
-            for p in api.list_positions():
-                sym = getattr(p, "symbol", None)
-                if sym:
-                    flatten(api, sym, ledger=None)
-        except Exception as e:
-            print(f"[EOD_WARN] list_positions/flatten: {e}")
+        # --- EOD: flatten all open trades EOD_FLATTEN_MIN_BEFORE_CLOSE minutes before regular close ---
+        mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
+        if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
+            print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
+            try:
+                # Close broker-side positions
+                for p in api.list_positions():
+                    sym = getattr(p, "symbol", None)
+                    if sym:
+                        flatten(api, sym, ledger=None)
+             except Exception as e:
+                print(f"[EOD_WARN] list_positions/flatten: {e}")
 
         # Reset local timers so next day starts clean
-        for sym in SYMBOLS:
-            state.setdefault("hold_timer", {})[sym] = 0
-        save_state(state)
+            for sym in SYMBOLS:
+                state.setdefault("hold_timer", {})[sym] = 0
+            save_state(state)
 
-        print("[EOD] All positions flattened. Ending session loop.")
-        break
+            print("[EOD] All positions flattened. Ending session loop.")
+            break
 
-    ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
+        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
 
-    unclamped_end = block_start + dt.timedelta(hours=1)
-    block_end = min(unclamped_end, session_close)
+        unclamped_end = block_start + dt.timedelta(hours=1)
+        block_end = min(unclamped_end, session_close)
 
-    secs_left = (session_close - block_start).total_seconds()
-    blocks_left = math.ceil(secs_left / 3600.0)
-    b += 1
+        secs_left = (session_close - block_start).total_seconds()
+        blocks_left = math.ceil(secs_left / 3600.0)
+        b += 1
 
-    print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
-    print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
+        print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
+        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-    eq = account_equity(api)
+        eq = account_equity(api)
 
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
