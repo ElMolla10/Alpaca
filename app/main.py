@@ -604,10 +604,10 @@ def run_session(api):
                     sym = getattr(p, "symbol", None)
                     if sym:
                         flatten(api, sym, ledger=None)
-             except Exception as e:
+            except Exception as e:
                 print(f"[EOD_WARN] list_positions/flatten: {e}")
 
-        # Reset local timers so next day starts clean
+            # Reset local timers so next day starts clean
             for sym in SYMBOLS:
                 state.setdefault("hold_timer", {})[sym] = 0
             save_state(state)
