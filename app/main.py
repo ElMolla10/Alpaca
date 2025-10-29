@@ -65,6 +65,10 @@ FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))
 # End-of-day hard exit N minutes before close
 EOD_FLATTEN_MIN_BEFORE_CLOSE = float(os.environ.get("EOD_FLATTEN_MIN_BEFORE_CLOSE", "2"))
 
+DAY_KILL_DD_PCT      = float(os.environ.get("DAY_KILL_DD_PCT", "1.0"))   # flatten+stop for the day at -1.0%
+DAY_THROTTLE_DD_PCT  = float(os.environ.get("DAY_THROTTLE_DD_PCT", "0.7"))  # start throttling at -0.7%
+THROTTLE_SIZE_MULT   = float(os.environ.get("THROTTLE_SIZE_MULT", "0.70"))  # scale positions when throttled
+
 
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
