@@ -617,18 +617,17 @@ def run_session(api):
 
     ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
 
+    unclamped_end = block_start + dt.timedelta(hours=1)
+    block_end = min(unclamped_end, session_close)
 
-        unclamped_end = block_start + dt.timedelta(hours=1)
-        block_end = min(unclamped_end, session_close)
+    secs_left = (session_close - block_start).total_seconds()
+    blocks_left = math.ceil(secs_left / 3600.0)
+    b += 1
 
-        secs_left = (session_close - block_start).total_seconds()
-        blocks_left = math.ceil(secs_left / 3600.0)
-        b += 1
+    print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
+    print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
-        print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET ===")
-        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
-
-        eq = account_equity(api)
+    eq = account_equity(api)
 
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
