@@ -62,6 +62,10 @@ FRIDAY_SIZE_MULT_LATE        = float(os.environ.get("FRIDAY_SIZE_MULT_LATE", "0.
 FRIDAY_BLOCK_NEW_AFTER_LATE  = os.environ.get("FRIDAY_BLOCK_NEW_AFTER_LATE", "1") == "1"
 FRIDAY_MIN_POS               = float(os.environ.get("FRIDAY_MIN_POS", "0.05"))
 
+# End-of-day hard exit N minutes before close
+EOD_FLATTEN_MIN_BEFORE_CLOSE = float(os.environ.get("EOD_FLATTEN_MIN_BEFORE_CLOSE", "2"))
+
+
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
@@ -582,13 +586,37 @@ def run_session(api):
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
     block_start   = t_now if t_now >= session_open else session_open
 
+    
+
     b = 0
     while True:
-        if block_start >= session_close:
-            print("[INFO] Reached session close window; stopping.")
-            break
+    if block_start >= session_close:
+        print("[INFO] Reached session close window; stopping.")
+        break
 
-        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
+    # --- EOD: flatten all open trades EOD_FLATTEN_MIN_BEFORE_CLOSE minutes before regular close ---
+    mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
+    if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
+        print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
+        try:
+            # Close broker-side positions
+            for p in api.list_positions():
+                sym = getattr(p, "symbol", None)
+                if sym:
+                    flatten(api, sym, ledger=None)
+        except Exception as e:
+            print(f"[EOD_WARN] list_positions/flatten: {e}")
+
+        # Reset local timers so next day starts clean
+        for sym in SYMBOLS:
+            state.setdefault("hold_timer", {})[sym] = 0
+        save_state(state)
+
+        print("[EOD] All positions flattened. Ending session loop.")
+        break
+
+    ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
+
 
         unclamped_end = block_start + dt.timedelta(hours=1)
         block_end = min(unclamped_end, session_close)
