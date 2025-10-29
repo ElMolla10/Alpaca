@@ -561,6 +561,10 @@ def run_session(api):
     acct = api.get_account()
     print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
+    # === Daily drawdown tracking ===
+    day_start_equity = account_equity(api)
+    throttled = False
+
     ensure_market_open_or_wait(api)
 
     if LONGS_ONLY:
@@ -628,6 +632,24 @@ def run_session(api):
         print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
 
         eq = account_equity(api)
+        eq_now = account_equity(api)
+        if day_start_equity > 0:
+            dd_day = 100.0 * (eq_now - day_start_equity) / day_start_equity
+
+            # Kill switch
+            if dd_day <= -abs(DAY_KILL_DD_PCT):
+                print(f"[KILL] Daily PnL {dd_day:.2f}% ≤ -{DAY_KILL_DD_PCT:.2f}% → flatten and stop.")
+                for p in api.list_positions():
+                    sym = getattr(p, "symbol", None)
+                    if sym:
+                        flatten(api, sym, ledger=None)
+                break
+
+            # Throttle
+            if (not throttled) and dd_day <= -abs(DAY_THROTTLE_DD_PCT):
+                throttled = True
+                print(f"[THROTTLE] Daily PnL {dd_day:.2f}% ≤ -{DAY_THROTTLE_DD_PCT:.2f}% → reducing size ×{THROTTLE_SIZE_MULT:.2f}")
+
 
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
@@ -716,6 +738,10 @@ def run_session(api):
                 if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and is_new_entry:
                     print(f"[FRIDAY] {sym}: blocking NEW entry after {FRIDAY_LATE_CUTOFF_H}:00 ET.")
                     continue
+                    
+                if throttled and target_frac != 0.0:
+                    target_frac *= THROTTLE_SIZE_MULT
+                    print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
 
                 px_print = px if (px and np.isfinite(px)) else float("nan")
                 print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
