@@ -1,4 +1,4 @@
-# 🧠 Agentic Reinforcement Learning Trading System
+# 🧠 Agentic E-Trading Bot
 
 A modular, adaptive trading engine built on **Reinforcement Learning (RL)**, contextual decision logic, and predictive modeling.  
 The system learns from trading performance, adjusts behavior based on reward feedback, and executes trades with strict risk and safety constraints.
