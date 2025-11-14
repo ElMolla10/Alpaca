@@ -598,29 +598,30 @@ def run_session(api):
 
     b = 0
     while True:
-        if block_start >= session_close:
-            print("[INFO] Reached session close window; stopping.")
-            break
-
-        # --- EOD: flatten all open trades EOD_FLATTEN_MIN_BEFORE_CLOSE minutes before regular close ---
+    
+        # 1) Always check EOD first based on *actual time*
         mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
         if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
             print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
             try:
-                # Close broker-side positions
                 for p in api.list_positions():
                     sym = getattr(p, "symbol", None)
                     if sym:
                         flatten(api, sym, ledger=None)
             except Exception as e:
                 print(f"[EOD_WARN] list_positions/flatten: {e}")
-
-            # Reset local timers so next day starts clean
+    
+            # Reset timers
             for sym in SYMBOLS:
                 state.setdefault("hold_timer", {})[sym] = 0
             save_state(state)
-
+    
             print("[EOD] All positions flattened. Ending session loop.")
+            break
+    
+        # 2) Then check if we’re beyond session_close
+        if block_start >= session_close:
+            print("[INFO] Reached session close window; stopping.")
             break
 
         ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
