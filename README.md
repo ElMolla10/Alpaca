@@ -1,111 +1,202 @@
-# 🧠 Agentic Reinforcement Learning Trading System
+Agentic E-Trading Engine
 
-This repository implements an **agentic reinforcement learning (RL)** trading system that adapts to user trading styles, learns from performance, and makes risk-aware trading decisions.  
-It integrates data from multiple sources, applies cost and slippage modeling, and uses XGBoost for predictive features.
+A modular, adaptive trading engine built on Reinforcement Learning (RL), contextual decision logic, and predictive modeling.
+The system learns from real trading performance, adjusts behavior based on reward feedback, and executes trades with strict safety and risk controls.
 
----
+This repository powers an agent that:
 
-## 📁 Project Structure
+Adapts position sizing and timing automatically
 
-```
+Learns from PnL-based rewards
+
+Uses XGBoost predictions as structured initial signals
+
+Models slippage, commissions, and execution uncertainty
+
+Supports user-specific trading styles
+
+📁 Project Structure
 app/
  ├── agent/
- │    ├── __init__.py          # Agent exports and optional modules
- │    └── arl_agent.py         # Main RL agent logic (core learning, actions)
+ │    ├── __init__.py
+ │    └── arl_agent.py          # Core RL logic, state updates, and policy methods
  │
  ├── model/
  │    ├── __init__.py
- │    └── XGboost_model.json   # Trained predictive model
+ │    └── XGboost_model.json    # Predictive model used for directional bias
  │
- ├── execution.py              # Handles order placement, fills, and ledger updates
- ├── feat_cols.json            # Feature column definitions
- ├── main.py                   # Entry point (system loop)
+ ├── execution.py               # Order execution, fills, slippage, and PnL ledger
+ ├── feat_cols.json             # List of engineered features used by the model
+ ├── main.py                    # Main loop orchestrating data → decision → execution
  │
- ├── render.yaml               # Deployment configuration
- ├── requirements.txt          # Dependencies
- ├── runtime.txt               # Python runtime version
- └── README.md                 # Project documentation
-```
+ ├── render.yaml                # Cloud deployment configuration
+ ├── requirements.txt           # Python dependencies
+ ├── runtime.txt                # Python runtime version
+ └── README.md
 
----
+⚙️ Core Components
+🔹 1. RL Agent (arl_agent.py)
 
-## ⚙️ Core Functionality
+The RL agent is the heart of the system:
 
-### 🔹 Reinforcement Learning Agent (`arl_agent.py`)
-- Learns from **PnL-based rewards** (realized profit minus fees and slippage).  
-- Adapts position sizing and trade direction dynamically.  
-- Resets state daily to avoid data leakage.  
-- Configurable user styles through the `UserStyle` dataclass (momentum, mean-reversion, etc.).  
+Learns from net PnL% per block
 
-### 🔹 Execution Layer (`execution.py`)
-- Manages **idempotent orders** (safe retries, no duplicates).  
-- Tracks slippage, commission, and partial fills.  
-- Updates a block-based ledger for PnL tracking.
+Adjusts size multiplier, timing, hold duration, and directional bias
 
-### 🔹 Model Layer (`model/XGboost_model.json`)
-- Predictive model used to guide the RL agent’s initial bias.  
-- Encodes recent price and volatility patterns for symbol selection.
+Responds dynamically to live performance and volatility
 
----
+Resets internal state daily to avoid leakage
 
-## 📊 Key Features
+Uses the UserStyle dataclass to shape personality:
 
-- **Dynamic policy learning** per trading block  
-- **Fee & slippage modeling** for realistic rewards  
-- **Risk-adjusted trade sizing**  
-- **Agent resets per session** to avoid lookahead bias  
-- **Extendable structure** for multi-agent integration (news, sentiment, etc.)
+momentum-focused
 
----
+mean-reversion
 
-## 🧠 Reward Mechanism
+conservative / aggressive risk levels
 
-The agent’s reward is proportional to the **block’s net PnL%**, ensuring learning aligns with actual profitability:
+The architecture allows the agent to change behavior without hardcoding strategies.
 
-\[
-Reward = \frac{PnL - Fees - Slippage}{Exposure}
-\]
+🔹 2. Execution Layer (execution.py)
 
----
+Handles all interaction with the broker (simulated or real):
 
-## 🚀 Running the Project
+Idempotent order placement (safe retries, no duplicates)
 
-```bash
-# 1. Install dependencies
+Partial fill handling
+
+Slippage and commission injection for realistic reward signals
+
+Maintains a block-based ledger tracking:
+
+realized PnL
+
+unrealized PnL
+
+exposures
+
+transaction cost impact
+
+🔹 3. Predictive Model (XGboost_model.json)
+
+An XGBoost model provides directional and volatility information:
+
+Encodes recent OHLCV patterns
+
+Provides a soft signal that guides the RL agent
+
+Never acts alone — the agent decides when to trust or ignore predictions
+
+This hybrid approach gives the system structured signals + adaptive learning.
+
+📊 Key Features
+
+Adaptive RL policy updated every trading block
+
+Context-aware trade sizing and timing
+
+Realistic slippage and fee modeling
+
+Directional bias from XGBoost predictions
+
+Daily state reset to avoid time leakage
+
+Extensible architecture (plug in sentiment, macro data, alternative agents)
+
+Deterministic reward loops to stabilize learning
+
+🧠 Reward Function
+
+The agent’s reward aligns directly with profitability:
+
+𝑅
+𝑒
+𝑤
+𝑎
+𝑟
+𝑑
+=
+𝑃
+𝑛
+𝐿
+−
+(
+𝐹
+𝑒
+𝑒
+𝑠
++
+𝑆
+𝑙
+𝑖
+𝑝
+𝑝
+𝑎
+𝑔
+𝑒
+)
+𝐸
+𝑥
+𝑝
+𝑜
+𝑠
+𝑢
+𝑟
+𝑒
+Reward=
+Exposure
+PnL−(Fees+Slippage)
+	​
+
+
+This ensures the system optimizes for risk-adjusted real returns, not just raw price movement.
+
+🚀 Running the System
+1️⃣ Install dependencies
 pip install -r requirements.txt
 
-# 2. Run main entry
+2️⃣ Run the engine
 python -m app.main
-```
 
-If your module path causes errors, make sure your working directory is set to the project root.
+3️⃣ (Optional) Fix path issues
 
----
+Make sure you run the command from the project root so imports resolve correctly.
 
-## 🧩 Configuration
+🧩 Configuration (UserStyle)
 
-Edit parameters in `UserStyle` (inside `arl_agent.py`) to change behavior:
+Customize trading behavior in arl_agent.py:
 
-| Parameter | Description | Example |
-|------------|--------------|----------|
-| `max_symbols` | number of tradable stocks | 8 |
-| `prefer_momentum` | favor uptrend breakouts | True |
-| `risk_level` | risk mode | "high" |
-| `base_size_mult` | base position multiplier | 1.0 |
+Parameter	Description	Example
+max_symbols	Maximum number of symbols to trade	8
+prefer_momentum	Bias toward trend continuation	True
+risk_level	Risk appetite	"high"
+base_size_mult	Starting size multiplier	1.0
+base_hold_min_blocks	Minimum holding duration	2
 
----
+You can define additional styles or override defaults per session.
 
-## ✅ QA & Validation
+🛡️ QA & Safety Checks
 
-- Checks for missing data, invalid features, or lookahead bias.  
-- Ensures all orders are unique and consistent across retries.  
-- Tracks execution success rate and exposure control.  
+The system validates its environment continuously:
 
----
+Detects missing or stale market data
 
-## 👥 Contributors
-- Mohamed Ehab  
-- Abdelrahman Tamer  
-- Mohamed Atef  
-- Moataz Kamal  
-- Yahia Abdelmonaem  
+Rejects orders with inconsistent size or invalid state
+
+Prevents duplicate executions via idempotent logic
+
+Ensures feature strictness (no future leakage or incomplete inputs)
+
+Logs execution success rates and exposure behavior for analysis
+
+👥 Contributors
+
+Mohamed Ehab
+
+Abdelrahman Tamer
+
+Mohamed Atef
+
+Moataz Kamal
+
+Yahia Abdelmonaem
