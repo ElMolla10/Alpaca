@@ -100,7 +100,7 @@ The Prisma schema includes:
 9. **Gross Exposure %** - Total position size / equity
 10. **Sharpe Ratio** - Risk-adjusted return metric
 
-## Features in v0 Preview
+## Features Preview
 
 - Full authentication system with database persistence
 - Real-time dashboard with mock trading data
@@ -151,7 +151,3 @@ When `DATABASE_URL` or Alpaca keys are missing:
 - Ensure `NEXTAUTH_SECRET` is set
 - Check cookies are enabled in browser
 - Verify `NEXTAUTH_URL` matches your domain
-
-## License
-
-MIT
