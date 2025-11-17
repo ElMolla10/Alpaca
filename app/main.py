@@ -73,7 +73,7 @@ THROTTLE_SIZE_MULT   = float(os.environ.get("THROTTLE_SIZE_MULT", "0.70"))  # sc
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
-AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "10"))
+AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "20"))
 
 # Trading costs (BPS)
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
