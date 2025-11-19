@@ -7,12 +7,12 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import pathlib
 import re
-import pickle  # for ElasticNet model
 
 import pytz
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import joblib
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
@@ -94,31 +94,22 @@ else:
 
 print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 
-# Model & features
-MODEL_PATH       = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
-FEATS_PATH       = os.environ.get("FEATS_PATH", "app/feat_cols.json")
-ELASTICNET_PATH  = os.environ.get("ELASTICNET_PATH", "app/model/elasticnet_ret1h.pkl")
-XGB_WEIGHT       = float(os.environ.get("XGB_WEIGHT", "0.5"))
-ELASTICNET_WEIGHT = float(os.environ.get("ELASTICNET_WEIGHT", "0.5"))
-
-# Normalize weights in case user changes env
-total_w = max(1e-12, XGB_WEIGHT + ELASTICNET_WEIGHT)
-XGB_WEIGHT        = XGB_WEIGHT / total_w
-ELASTICNET_WEIGHT = ELASTICNET_WEIGHT / total_w
+# =================== MODEL & FEATURES ===================
+MODEL_PATH = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
+FEATS_PATH = os.environ.get("FEATS_PATH", "app/feat_cols.json")
+ENET_PATH  = os.environ.get("ENET_PATH", "app/model/elasticnet_ret1h.pkl")
 
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
+print(f"[INIT] loaded XGBoost model from {MODEL_PATH}")
 
-elasticnet_model = None
-try:
-    with open(ELASTICNET_PATH, "rb") as f:
-        elasticnet_model = pickle.load(f)
-    print(f"[INIT] loaded ElasticNet model from {ELASTICNET_PATH}")
-except Exception as e:
-    print(f"[WARN] ElasticNet model load failed from {ELASTICNET_PATH}: {e}")
-    elasticnet_model = None
-
-print(f"[INIT] loaded feature set from {FEATS_PATH}")
+elastic_model = None
+if os.path.exists(ENET_PATH):
+    try:
+        elastic_model = joblib.load(ENET_PATH)
+        print(f"[INIT] loaded ElasticNet model from {ENET_PATH}")
+    except Exception as e:
+        print(f"[WARN] failed to load ElasticNet model: {e}")
 
 # Persisted state
 STATE_PATH = os.environ.get("STATE_PATH", "/tmp/live_state.json")
@@ -361,7 +352,7 @@ def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedge
 # =================== FEATURE PIPELINE (LIVE) ===================
 with open(FEATS_PATH, "r") as f:
     FEAT_COLS = json.load(f)
-print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
+print(f"[INIT] loaded {len(FEAT_COLS)} feat cols from {FEATS_PATH}")
 print(f"[PARITY] FEAT_COLS={len(FEAT_COLS)} window=10:00–15:59 ET, horizon={PRIMARY_H}h, band_R={BAND_R}")
 
 def _ts_to_utc(ts_any) -> pd.Timestamp:
@@ -376,6 +367,13 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     Pull last ~30 days of HOURLY bars and (if between 10:00 and <11:00 ET)
     synthesize a partial 10:00→now bar from minute data so the first block
     is tradable without waiting for 11:00.
+
+    Then build leakage-safe features aligned with offline builder:
+      - Filter to 10:00–15:59 ET
+      - ret1h_pct, sigma20_pct
+      - price_change_pct_lag1/2/3
+      - shifted OHLCV/VWAP
+      - vol20, ret5
     """
 
     now_utc = datetime.now(timezone.utc)
@@ -487,42 +485,42 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
         print(f"[WARN] {sym}: bars after RTH filter are empty")
         return df
 
-    # --- Indicators ---
-    df["price_change_pct"] = df["close"].pct_change() * 100.0
-    macd_ind = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
-    df["MACDh_12_26_9"] = macd_ind.macd_diff()
-    bb = BollingerBands(close=df["close"], window=20, window_dev=2.0)
-    df["BBM_20_2.0"] = bb.bollinger_mavg()
+    # === Canonical leakage-safe features (aligned with offline builder) ===
 
-    df["ret1h_pct"] = df["close"].pct_change().shift(-1) * 100.0
+    # 1h forward return in %
+    df["ret1h_pct"] = df["close"].pct_change(fill_method=None).shift(-1) * 100.0
+
+    # sigma20: rolling std of ret1h_pct, shifted 1 bar
     df["sigma20_pct"] = df["ret1h_pct"].rolling(20).std().shift(1)
     df["sigma20_pct"] = df["sigma20_pct"].replace(0.0, np.nan)
 
-    base = ["open","high","low","close","volume","vwap",
-            "price_change_pct","MACDh_12_26_9","BBM_20_2.0"]
-    for f in base:
-        if f not in df.columns:
-            df[f] = 0.0
-        df[f] = df[f].shift(1)
+    # price_change_pct and its lags (only past info)
+    df["price_change_pct"] = df["close"].pct_change(fill_method=None) * 100.0
+    df["price_change_pct_lag1"] = df["price_change_pct"].shift(1)
+    df["price_change_pct_lag2"] = df["price_change_pct"].shift(2)
+    df["price_change_pct_lag3"] = df["price_change_pct"].shift(3)
 
-    for f in ["price_change_pct","MACDh_12_26_9","BBM_20_2.0"]:
-        df[f+"_lag2"] = df[f].shift(2)
-        df[f+"_lag3"] = df[f].shift(3)
-
-    df["vol20"] = df["ret1h_pct"].rolling(20).std().shift(1)
-    df["ret5"]  = df["close"].pct_change(5).shift(1) * 100.0
-
-    for f in ["price_change_pct","ret5","vol20","MACDh_12_26_9","BBM_20_2.0"]:
+    # Shift OHLCV+VWAP by 1 bar to avoid look-ahead
+    for f in ["open", "high", "low", "close", "volume", "vwap"]:
         if f in df.columns:
-            df[f+"_N"] = df[f] / df["sigma20_pct"]
+            df[f] = df[f].shift(1)
 
+    # Simple volatility and multi-bar return
+    df["vol20"] = df["ret1h_pct"].rolling(20).std().shift(1)
+    df["ret5"]  = df["close"].pct_change(5, fill_method=None).shift(1) * 100.0
+
+    # Drop rows with NaNs in any engineered columns
     df = df.dropna().reset_index(drop=True)
+    if df.empty:
+        print(f"[WARN] {sym}: no rows after feature dropna")
+        return df
 
+    # Ensure all FEAT_COLS present
     for c in FEAT_COLS:
         if c not in df.columns:
             df[c] = 0.0
 
-    df = df[["timestamp"] + [c for c in FEAT_COLS if c in df.columns]]
+    df = df[["timestamp", "ret1h_pct", "sigma20_pct"] + [c for c in FEAT_COLS if c in df.columns]]
     return df
 
 def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
@@ -548,35 +546,96 @@ def target_position_from_pred(pred_pct_live: float, band_R: float, hl: int, sym:
     state["pos_ema"][sym] = pos
     return pos
 
-def predict_block_return_pct(api: REST, sym: str) -> float:
+def predict_block_signal(api: REST, sym: str) -> dict:
+    """
+    Returns an enriched signal dict:
+      {
+        "pred_pct": float,   # ensemble predicted 1h return (%)
+        "p_up": float,       # 0..1 probability-like score
+        "vol_est": float,    # sigma20_pct estimate
+        "per_model": { "elastic": float|None,
+                       "xgb": float|None }
+      }
+    """
+    out = {
+        "pred_pct": 0.0,
+        "p_up": 0.5,
+        "vol_est": float("nan"),
+        "per_model": {"elastic": None, "xgb": None},
+    }
+
     try:
         df = fetch_recent_features(api, sym)
         if df is None or df.empty:
             print(f"[WARN] {sym}: no features (empty df)")
-            return 0.0
-        X = df[FEAT_COLS].astype(float).iloc[-1:].values
-        last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
-        print(f"[DBG] {sym}: feature row OK shape={X.shape} last_ts={last_ts}")
+            return out
 
-        # XGBoost prediction
-        dmat = xgb.DMatrix(X, feature_names=FEAT_COLS)
-        xgb_pred = float(booster.predict(dmat)[0])   # % per 1h
+        last = df.iloc[-1]
+        X = last[FEAT_COLS].astype(float).to_numpy().reshape(1, -1)
+        last_ts = last["timestamp"]
+        vol_est = float(last.get("sigma20_pct", np.nan))
+        if not np.isfinite(vol_est) or vol_est <= 0:
+            # fallback: realized volatility of recent ret1h_pct
+            if "ret1h_pct" in df.columns and len(df) > 30:
+                vol_est = float(df["ret1h_pct"].tail(30).std())
+            else:
+                vol_est = 1.0
 
-        # ElasticNet prediction (if available)
-        if elasticnet_model is not None:
-            enet_pred = float(elasticnet_model.predict(X)[0])
+        out["vol_est"] = vol_est
+        print(f"[DBG] {sym}: feature row OK shape={X.shape} last_ts={last_ts} vol_est={vol_est:.4f}")
+
+        preds = {}
+
+        # ElasticNet
+        if elastic_model is not None:
+            try:
+                preds["elastic"] = float(elastic_model.predict(X)[0])
+            except Exception as e:
+                print(f"[WARN] {sym}: ElasticNet predict failed: {e}")
+                preds["elastic"] = None
         else:
-            enet_pred = xgb_pred  # fallback to XGB only
+            preds["elastic"] = None
 
-        # Blended ensemble prediction
-        pred = XGB_WEIGHT * xgb_pred + ELASTICNET_WEIGHT * enet_pred
+        # XGBoost
+        try:
+            dmat = xgb.DMatrix(X, feature_names=FEAT_COLS)
+            xgb_pred = float(booster.predict(dmat)[0])
+            preds["xgb"] = xgb_pred
+        except Exception as e:
+            print(f"[WARN] {sym}: XGB predict failed: {e}")
+            preds["xgb"] = None
 
-        print(f"[DBG] {sym}: xgb={xgb_pred:.4f}% enet={enet_pred:.4f}% blended={pred:.4f}% "
-              f"(w_xgb={XGB_WEIGHT:.2f}, w_enet={ELASTICNET_WEIGHT:.2f})")
-        return pred
+        out["per_model"] = preds
+
+        valid = [v for v in preds.values() if v is not None and np.isfinite(v)]
+        if not valid:
+            print(f"[WARN] {sym}: all model preds invalid → pred_pct=0")
+            return out
+
+        pred_pct = float(sum(valid) / len(valid))
+        out["pred_pct"] = pred_pct
+
+        # Convert scaled return to a probability-like score using vol_est
+        denom = max(1e-6, abs(vol_est))
+        z = pred_pct / denom
+        z = max(-10.0, min(10.0, z))
+        k = 1.0
+        p_up = 1.0 / (1.0 + math.exp(-k * z))
+        out["p_up"] = p_up
+
+        print(
+            f"[SIGNAL] {sym}: "
+            f"pred_1h={pred_pct:.4f}% "
+            f"p_up={p_up:.3f} "
+            f"vol_est={vol_est:.4f} "
+            f"per_model={preds}"
+        )
+        return out
+
     except Exception as e:
-        print(f"[ERR] predict {sym}: {e}")
-        return 0.0
+        print(f"[ERR] predict_block_signal {sym}: {e}")
+        traceback.print_exc(limit=1)
+        return out
 
 # =================== MAIN LOOP ===================
 def run_session(api):
@@ -737,9 +796,14 @@ def run_session(api):
                 if px is None:
                     px = latest_price(api, sym)
                     price_cache[sym] = px
-                pred = predict_block_return_pct(api, sym)  # % for next 1h
+
+                signal = predict_block_signal(api, sym)
+                pred = float(signal["pred_pct"])
+                p_up = float(signal["p_up"])
+                vol_est = float(signal["vol_est"]) if np.isfinite(signal["vol_est"]) else float("nan")
+
                 if pred == 0.0:
-                    print(f"[WARN] {sym}: prediction is 0.0 (check features)")
+                    print(f"[WARN] {sym}: ensemble prediction is 0.0 (check features/models)")
                 pred *= SIGN_MULT
 
                 band_R_used = dec.band_R_override if dec.band_R_override is not None else BAND_R
@@ -775,7 +839,10 @@ def run_session(api):
                     print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
 
                 px_print = px if (px and np.isfinite(px)) else float("nan")
-                print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% target_pos={target_frac:+.3f}")
+                print(
+                    f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% "
+                    f"p_up={p_up:.3f} vol_est={vol_est:.4f} target_pos={target_frac:+.3f}"
+                )
 
                 submit_target(api, sym, target_frac, eq, px, ledger=ledger)
 
