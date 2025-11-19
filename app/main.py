@@ -12,7 +12,11 @@ import pytz
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-import joblib  # for ElasticNet / sklearn pipelines
+try:
+    import joblib  # for ElasticNet / sklearn pipelines
+except ImportError:
+    joblib = None
+    print("[INIT] joblib not available; ElasticNet model will be disabled (XGBoost only).")
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
@@ -110,12 +114,14 @@ print(f"[INIT] Loaded XGBoost model from {MODEL_PATH_XGB}")
 
 # ElasticNet (sklearn pipeline or estimator)
 enet_model = None
-if os.path.exists(MODEL_PATH_ENET):
+if joblib is not None and os.path.exists(MODEL_PATH_ENET):
     try:
         enet_model = joblib.load(MODEL_PATH_ENET)
         print(f"[INIT] Loaded ElasticNet model from {MODEL_PATH_ENET}")
     except Exception as e:
         print(f"[WARN] Failed to load ElasticNet from {MODEL_PATH_ENET}: {e}")
+elif joblib is None:
+    print(f"[INIT] joblib missing → ElasticNet disabled, running with XGBoost only.")
 else:
     print(f"[INIT] ElasticNet path {MODEL_PATH_ENET} not found; running with XGBoost only.")
 
