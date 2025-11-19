@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import pathlib
 import re
+import pickle  # for ElasticNet model
 
 import pytz
 import numpy as np
@@ -69,7 +70,6 @@ DAY_KILL_DD_PCT      = float(os.environ.get("DAY_KILL_DD_PCT", "1.0"))   # flatt
 DAY_THROTTLE_DD_PCT  = float(os.environ.get("DAY_THROTTLE_DD_PCT", "0.7"))  # start throttling at -0.7%
 THROTTLE_SIZE_MULT   = float(os.environ.get("THROTTLE_SIZE_MULT", "0.70"))  # scale positions when throttled
 
-
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
@@ -95,11 +95,29 @@ else:
 print(f"[INIT] using data feed={ALPACA_DATA_FEED}")
 
 # Model & features
-MODEL_PATH = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
-FEATS_PATH = os.environ.get("FEATS_PATH", "app/feat_cols.json")
+MODEL_PATH       = os.environ.get("MODEL_PATH", "app/model/XGboost_model.json")
+FEATS_PATH       = os.environ.get("FEATS_PATH", "app/feat_cols.json")
+ELASTICNET_PATH  = os.environ.get("ELASTICNET_PATH", "app/model/elasticnet_ret1h.pkl")
+XGB_WEIGHT       = float(os.environ.get("XGB_WEIGHT", "0.5"))
+ELASTICNET_WEIGHT = float(os.environ.get("ELASTICNET_WEIGHT", "0.5"))
+
+# Normalize weights in case user changes env
+total_w = max(1e-12, XGB_WEIGHT + ELASTICNET_WEIGHT)
+XGB_WEIGHT        = XGB_WEIGHT / total_w
+ELASTICNET_WEIGHT = ELASTICNET_WEIGHT / total_w
 
 booster = xgb.Booster()
 booster.load_model(MODEL_PATH)
+
+elasticnet_model = None
+try:
+    with open(ELASTICNET_PATH, "rb") as f:
+        elasticnet_model = pickle.load(f)
+    print(f"[INIT] loaded ElasticNet model from {ELASTICNET_PATH}")
+except Exception as e:
+    print(f"[WARN] ElasticNet model load failed from {ELASTICNET_PATH}: {e}")
+    elasticnet_model = None
+
 print(f"[INIT] loaded feature set from {FEATS_PATH}")
 
 # Persisted state
@@ -507,8 +525,6 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     df = df[["timestamp"] + [c for c in FEAT_COLS if c in df.columns]]
     return df
 
-
-
 def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
     s = float(pred_pct) / max(1e-12, band_R)
     s = max(-10.0, min(10.0, s))
@@ -541,9 +557,22 @@ def predict_block_return_pct(api: REST, sym: str) -> float:
         X = df[FEAT_COLS].astype(float).iloc[-1:].values
         last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
         print(f"[DBG] {sym}: feature row OK shape={X.shape} last_ts={last_ts}")
+
+        # XGBoost prediction
         dmat = xgb.DMatrix(X, feature_names=FEAT_COLS)
-        pred = float(booster.predict(dmat)[0])   # % per 1h
-        print(f"[DBG] {sym}: booster_pred={pred:.4f}%")
+        xgb_pred = float(booster.predict(dmat)[0])   # % per 1h
+
+        # ElasticNet prediction (if available)
+        if elasticnet_model is not None:
+            enet_pred = float(elasticnet_model.predict(X)[0])
+        else:
+            enet_pred = xgb_pred  # fallback to XGB only
+
+        # Blended ensemble prediction
+        pred = XGB_WEIGHT * xgb_pred + ELASTICNET_WEIGHT * enet_pred
+
+        print(f"[DBG] {sym}: xgb={xgb_pred:.4f}% enet={enet_pred:.4f}% blended={pred:.4f}% "
+              f"(w_xgb={XGB_WEIGHT:.2f}, w_enet={ELASTICNET_WEIGHT:.2f})")
         return pred
     except Exception as e:
         print(f"[ERR] predict {sym}: {e}")
@@ -594,11 +623,9 @@ def run_session(api):
     session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
     block_start   = t_now if t_now >= session_open else session_open
 
-    
-
     b = 0
     while True:
-    
+
         # 1) Always check EOD first based on *actual time*
         mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
         if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
@@ -610,15 +637,15 @@ def run_session(api):
                         flatten(api, sym, ledger=None)
             except Exception as e:
                 print(f"[EOD_WARN] list_positions/flatten: {e}")
-    
+
             # Reset timers
             for sym in SYMBOLS:
                 state.setdefault("hold_timer", {})[sym] = 0
             save_state(state)
-    
+
             print("[EOD] All positions flattened. Ending session loop.")
             break
-    
+
         # 2) Then check if we’re beyond session_close
         if block_start >= session_close:
             print("[INFO] Reached session close window; stopping.")
@@ -654,7 +681,6 @@ def run_session(api):
             if (not throttled) and dd_day <= -abs(DAY_THROTTLE_DD_PCT):
                 throttled = True
                 print(f"[THROTTLE] Daily PnL {dd_day:.2f}% ≤ -{DAY_THROTTLE_DD_PCT:.2f}% → reducing size ×{THROTTLE_SIZE_MULT:.2f}")
-
 
         is_fri, ny_hour = is_friday_ny()
         is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
@@ -743,7 +769,7 @@ def run_session(api):
                 if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and is_new_entry:
                     print(f"[FRIDAY] {sym}: blocking NEW entry after {FRIDAY_LATE_CUTOFF_H}:00 ET.")
                     continue
-                    
+
                 if throttled and target_frac != 0.0:
                     target_frac *= THROTTLE_SIZE_MULT
                     print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
