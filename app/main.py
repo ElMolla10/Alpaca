@@ -22,6 +22,7 @@ from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
 from dotenv import load_dotenv
 
+
 # Load .env variables early
 load_dotenv()
 
@@ -682,21 +683,33 @@ def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) 
 
 # =================== MAIN LOOP ===================
 def run_session(api):
+    from app.driftwatch_client import DriftWatchClient
     dw = DriftWatchClient()
-    state = load_state()
-    state.setdefault("open_req_id", {})
-    today = now_ny().strftime("%Y-%m-%d")
-    if state.get("last_day") != today:
-        state = {
-            "pos_ema": {},
-            "hold_timer": {},
-            "last_day": today,
-            "agent": state.get("agent", {})   # persist agent learning across days
-        }
-        save_state(state)
+    try:
+        state = load_state()
+        state.setdefault("open_req_id", {})
+        today = now_ny().strftime("%Y-%m-%d")
 
-    acct = api.get_account()
-    print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
+        if state.get("last_day") != today:
+            state = {
+                "pos_ema": {},
+                "hold_timer": {},
+                "open_req_id": {},              # ✅ keep inside state on new day
+                "last_day": today,
+                "agent": state.get("agent", {}) # persist agent learning across days
+            }
+            save_state(state)
+        else:
+            state.setdefault("open_req_id", {})  # ✅ ensure exists on same day
+
+        acct = api.get_account()
+        print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
+
+        # ... keep the rest of your existing run_session code here ...
+
+    finally:
+        dw.close()
+
 
     # === Daily drawdown tracking ===
     day_start_equity = account_equity(api)
@@ -959,6 +972,7 @@ def run_session(api):
                 after_n = ledger.fills_count(sym)
 
                 submitted = after_n > before_n
+
 
                 # store request_id only for a real new entry
                 if submitted and is_new_entry:
