@@ -29,6 +29,39 @@ load_dotenv()
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
 from app.execution import BlockLedger
 
+# === DriftWatch ===
+from app.driftwatch_client import DriftWatchClient
+
+DW_MODEL_ID = "trading_ensemble_ret_1h"
+DW_MODEL_VERSION = "mock-v1"
+DW_TIMEFRAME = "1h"
+
+DW_REQUIRED_FEATURE_KEYS = [
+    "pred_pct", "p_up", "sigma20_pct", "price_change_pct", "ret5", "vol20",
+    "MACDh_12_26_9", "BBM_20_2.0",
+    "price_change_pct_lag2", "price_change_pct_lag3",
+    "MACDh_12_26_9_lag2", "MACDh_12_26_9_lag3",
+    "BBM_20_2.0_lag2", "BBM_20_2.0_lag3",
+    "px", "target_frac"
+]
+
+def dw_env_from_base_url(base_url: str) -> str:
+    return "paper" if ("paper" in (base_url or "").lower()) else "live"
+
+def _to_float_or_none(x):
+    if x is None:
+        return None
+    try:
+        # numpy scalars -> python scalars
+        if isinstance(x, np.generic):
+            x = x.item()
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
 # =================== CONFIG / ENV ===================
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
 TZ_NY = pytz.timezone("America/New_York")
@@ -535,6 +568,19 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     if "sigma20_pct" in df.columns and "sigma20_pct" not in cols:
         cols.append("sigma20_pct")
 
+        # --- Ensure DriftWatch raw feature columns are present in returned df ---
+    DW_RAW_FROM_DF = [
+        "sigma20_pct", "price_change_pct", "ret5", "vol20",
+        "MACDh_12_26_9", "BBM_20_2.0",
+        "price_change_pct_lag2", "price_change_pct_lag3",
+        "MACDh_12_26_9_lag2", "MACDh_12_26_9_lag3",
+        "BBM_20_2.0_lag2", "BBM_20_2.0_lag3"
+    ]
+    for c in DW_RAW_FROM_DF:
+        if c in df.columns and c not in cols:
+            cols.append(c)
+
+
     df = df[cols]
     return df
 
@@ -561,7 +607,7 @@ def target_position_from_pred(pred_pct_live: float, band_R: float, hl: int, sym:
     state["pos_ema"][sym] = pos
     return pos
 
-def predict_block_signal(api: REST, sym: str) -> dict:
+def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) -> dict:
     """
     Returns an enriched prediction dict:
       - pred_pct: ensemble mean predicted 1h return in %
@@ -577,10 +623,8 @@ def predict_block_signal(api: REST, sym: str) -> dict:
         "per_model": {"xgb": None, "elastic": None}
     }
     try:
-        df = fetch_recent_features(api, sym)
+        df = df_override if df_override is not None else fetch_recent_features(api, sym)
         if df is None or df.empty:
-            print(f"[WARN] {sym}: no features (empty df)")
-            return out
 
         X = df[FEAT_COLS].astype(float).iloc[-1:].values
         last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
@@ -634,6 +678,7 @@ def predict_block_signal(api: REST, sym: str) -> dict:
 
 # =================== MAIN LOOP ===================
 def run_session(api):
+    dw = DriftWatchClient()
     state = load_state()
     today = now_ny().strftime("%Y-%m-%d")
     if state.get("last_day") != today:
@@ -710,6 +755,9 @@ def run_session(api):
         # Use BLOCK_MINUTES instead of fixed 1h
         unclamped_end = block_start + dt.timedelta(minutes=BLOCK_MINUTES)
         block_end = min(unclamped_end, session_close)
+        
+        block_id = block_start.isoformat()  # ET offset included
+        env = dw_env_from_base_url(BASE_URL)
 
         secs_left = (session_close - block_start).total_seconds()
         blocks_left = max(1, math.ceil(secs_left / float(BLOCK_SECONDS)))
@@ -831,6 +879,64 @@ def run_session(api):
                     target_frac *= THROTTLE_SIZE_MULT
                     print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
 
+                                # --- DriftWatch logging (inference + decision latency only) ---
+                t0 = time.perf_counter()
+
+                # reuse the df already fetched for agent selection
+                df_feat = sym_to_df.get(sym)
+                sig = predict_block_signal(api, sym, df_override=df_feat)
+
+                pred = sig["pred_pct"] * SIGN_MULT
+
+                # (your existing target_frac logic continues here...)
+                # target_frac = target_position_from_pred(...)
+
+                latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
+
+                # Feature snapshot from the same df row used for inference
+                feat_row = None
+                if df_feat is not None and not df_feat.empty:
+                    feat_row = df_feat.iloc[-1]
+
+                features_json = {k: None for k in DW_REQUIRED_FEATURE_KEYS}
+                features_json["pred_pct"] = _to_float_or_none(pred)
+                features_json["p_up"] = _to_float_or_none(sig.get("p_up"))
+                features_json["sigma20_pct"] = _to_float_or_none(sig.get("vol_est"))
+                features_json["px"] = _to_float_or_none(px)
+                features_json["target_frac"] = _to_float_or_none(target_frac)
+
+                # fill raw feature cols if available
+                if feat_row is not None:
+                    for k in features_json.keys():
+                        if k in ("pred_pct", "p_up", "sigma20_pct", "px", "target_frac"):
+                            continue
+                        if k in feat_row.index:
+                            features_json[k] = _to_float_or_none(feat_row[k])
+
+                segment_json = {
+                    "sym": sym,
+                    "timeframe": DW_TIMEFRAME,
+                    "env": env,
+                    "session": "regular",
+                    "block_id": block_id,
+                    "block_minutes": BLOCK_MINUTES,
+                }
+
+                request_id = f"{block_id}|{sym}"
+
+                dw.log_inference(
+                    model_id=DW_MODEL_ID,
+                    model_version=DW_MODEL_VERSION,
+                    ts=datetime.now(timezone.utc),
+                    pred_type="regression",
+                    y_pred_num=_to_float_or_none(pred),
+                    y_pred_text=None,
+                    latency_ms=latency_ms,
+                    features_json=features_json,
+                    segment_json=segment_json,
+                    request_id=request_id
+                )
+
                 px_print = px if (px and np.isfinite(px)) else float("nan")
                 print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% p_up={sig['p_up']:.3f} vol_est={sig['vol_est']:.4f} target_pos={target_frac:+.3f}")
 
@@ -864,6 +970,7 @@ def run_session(api):
         save_state(state)
 
         print("[EXIT] flattening block positions...", flush=True)
+                print("[EXIT] flattening block positions...", flush=True)
         for sym in SYMBOLS:
             rem = int(state.get("hold_timer", {}).get(sym, 0))
             if rem <= 1:
@@ -875,7 +982,12 @@ def run_session(api):
                 print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
         save_state(state)
+
+        # DriftWatch: end-of-block flush (safe even if buffer is empty)
+        dw.flush()
+
         block_start = block_end
+
 
 # =================== ENTRY ===================
 if __name__ == "__main__":
