@@ -1,7 +1,7 @@
 # app/execution.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 import time
 
@@ -17,8 +17,8 @@ class Fill:
 
 class BlockLedger:
     """
-    Per-block trade ledger that computes **net PnL% after fees+slippage** per symbol.
-    If you don't have real-time fills, it's valid to record at the last trade price as an approximation.
+    Trade ledger that computes **net PnL% after fees+slippage** per symbol.
+    Works with holds across multiple blocks: entry can be in block A, exit in block B.
     """
     def __init__(self, trade_cost_bps: float, slip_bps: float):
         self.trade_cost_bps = float(trade_cost_bps)
@@ -30,11 +30,18 @@ class BlockLedger:
         bps = (self.trade_cost_bps + self.slip_bps) / 10_000.0
         fees_abs = abs(notional_signed) * bps
         self._fills[symbol].append(
-            Fill(ts=time.time(), symbol=symbol, side=side, qty=qty, price=price,
-                 notional=notional_signed, fees_abs=fees_abs)
+            Fill(
+                ts=time.time(),
+                symbol=symbol,
+                side=side,
+                qty=float(qty),
+                price=float(price),
+                notional=float(notional_signed),
+                fees_abs=float(fees_abs),
+            )
         )
 
-        def compute_symbol_pnl_pct(self, sym: str) -> float | None:
+    def compute_symbol_pnl_pct(self, sym: str) -> Optional[float]:
         fills = self._fills.get(sym, [])
         if not fills:
             return None
@@ -42,13 +49,12 @@ class BlockLedger:
         buy_notional  = sum(f.qty * f.price for f in fills if f.side == "buy")
         sell_notional = sum(f.qty * f.price for f in fills if f.side == "sell")
 
-        # Entry basis: use the side of the first fill as the "entry side"
+        # Exposure basis: pick a stable denominator based on first fill side (supports shorts)
         first_side = fills[0].side
         gross_exposed = buy_notional if first_side == "buy" else sell_notional
 
         pnl_abs = sell_notional - buy_notional
-        costs = sum(f.fees_abs for f in fills)
-        pnl_abs -= costs
+        pnl_abs -= sum(f.fees_abs for f in fills)
 
         return 0.0 if gross_exposed <= 0 else (pnl_abs / gross_exposed) * 100.0
 
@@ -58,3 +64,6 @@ class BlockLedger:
 
     def fills_count(self, sym: str) -> int:
         return len(self._fills.get(sym, []))
+
+    def reset(self) -> None:
+        self._fills.clear()
