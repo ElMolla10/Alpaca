@@ -34,29 +34,27 @@ class BlockLedger:
                  notional=notional_signed, fees_abs=fees_abs)
         )
 
-    def compute_block_pnl_pct(self) -> Dict[str, float]:
-        """
-        Returns per-symbol net PnL% normalized by gross entry notional in this block.
-        Assumes end-of-block flattening (your main loop does this).
-        """
-        out: Dict[str, float] = {}
-        for sym, fills in self._fills.items():
-            if not fills:
-                continue
+        def compute_symbol_pnl_pct(self, sym: str) -> float | None:
+        fills = self._fills.get(sym, [])
+        if not fills:
+            return None
 
-            # Exposure basis: count only entries/extends (abs of buys when opening or sells when shorting)
-            # Simple proxy that works with hourly-open/flatten workflow:
-            gross_exposed = sum(abs(f.notional) for f in fills if f.notional > 0)
+        buy_notional  = sum(f.qty * f.price for f in fills if f.side == "buy")
+        sell_notional = sum(f.qty * f.price for f in fills if f.side == "sell")
 
-            # Realized PnL ≈ sum(sell_notional) - sum(buy_notional) - fees
-            buy_notional  = sum(f.qty * f.price for f in fills if f.side == "buy")
-            sell_notional = sum(f.qty * f.price for f in fills if f.side == "sell")
-            pnl_abs = sell_notional - buy_notional
-            costs = sum(f.fees_abs for f in fills)
-            pnl_abs -= costs
+        # Entry basis: use the side of the first fill as the "entry side"
+        first_side = fills[0].side
+        gross_exposed = buy_notional if first_side == "buy" else sell_notional
 
-            out[sym] = 0.0 if gross_exposed <= 0 else (pnl_abs / gross_exposed) * 100.0
-        return out
+        pnl_abs = sell_notional - buy_notional
+        costs = sum(f.fees_abs for f in fills)
+        pnl_abs -= costs
 
-    def reset(self) -> None:
-        self._fills.clear()
+        return 0.0 if gross_exposed <= 0 else (pnl_abs / gross_exposed) * 100.0
+
+    def clear_symbol(self, sym: str) -> None:
+        if sym in self._fills:
+            del self._fills[sym]
+
+    def fills_count(self, sym: str) -> int:
+        return len(self._fills.get(sym, []))
