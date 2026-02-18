@@ -3,71 +3,64 @@ import os, sys, time, traceback, math
 import datetime as dt
 import pytz
 from datetime import datetime, timezone
-from alpaca_trade_api import REST, TimeFrame
+from alpaca_trade_api.rest import REST, TimeFrame  # ✅ safer import
 
-# --- add this helper ---
+from app.driftwatch_client import DriftWatchClient  # ✅ DriftWatch
+
+# --- helpers ---
 def utc_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
+def dw_env_from_base_url(base_url: str) -> str:
+    return "paper" if ("paper" in (base_url or "").lower()) else "live"
 
+def _safe_float(x):
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+# =================== DEBUG HEADER ===================
 print("=== DEBUG START ===", flush=True)
-import os, sys, traceback
 print("Python version:", sys.version)
 print("Current directory:", os.getcwd())
-print("Env keys:", list(os.environ.keys()))
 print("=== END DEBUG HEADER ===", flush=True)
 
 # =================== CONFIG ===================
 TZ_NY = pytz.timezone("America/New_York")
 
-# Block schedule (normal run)
-BLOCK_STARTS_ET = [(10,0), (13,0)]
-BLOCK_ENDS_ET   = [(13,0), (16,0)]
+POLL_SECONDS   = 15
+HEARTBEAT_SEC  = 60
+HARD_LIMIT_SEC = 3*3600+90
 
-POLL_SECONDS   = 15        # status/stop check cadence
-HEARTBEAT_SEC  = 60        # heartbeat print cadence
-HARD_LIMIT_SEC = 3*3600+90 # safety stop for any run
-
-# Test mode flags (set in Render → Environment)
-TEST_MODE     = os.environ.get("TEST_MODE", "0") == "1"      # 1 = force a visible trade
+TEST_MODE     = os.environ.get("TEST_MODE", "0") == "1"
 TEST_SYMBOL   = os.environ.get("TEST_SYMBOL", "AAPL")
-TEST_HOLD_MIN = int(os.environ.get("TEST_HOLD_MIN", "0"))    # when >0, run NOW for N minutes
+TEST_HOLD_MIN = int(os.environ.get("TEST_HOLD_MIN", "0"))
 
-# ================== UTILITIES ==================
+# DriftWatch constants (match main setup)
+DW_MODEL_ID = "trading_ensemble_ret_1h"
+DW_MODEL_VERSION = "liveblocks-v1"
+DW_TIMEFRAME = "1h"
+DW_REQUIRED_FEATURE_KEYS = [
+    "pred_pct", "p_up", "sigma20_pct", "price_change_pct", "ret5", "vol20",
+    "MACDh_12_26_9", "BBM_20_2.0",
+    "price_change_pct_lag2", "price_change_pct_lag3",
+    "MACDh_12_26_9_lag2", "MACDh_12_26_9_lag3",
+    "BBM_20_2.0_lag2", "BBM_20_2.0_lag3",
+    "px", "target_frac"
+]
+
 def now_ny():
     return dt.datetime.now(TZ_NY)
 
-def utc_stamp():
-    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def next_block_window():
-    """Pick next block [start, end] in ET. If TEST_HOLD_MIN>0: run now for N minutes."""
-    t = now_ny().replace(second=0, microsecond=0)
-    if TEST_HOLD_MIN > 0:
-        return t, t + dt.timedelta(minutes=TEST_HOLD_MIN)
-
-    starts = [t.replace(hour=h, minute=m) for (h,m) in BLOCK_STARTS_ET]
-    ends   = [t.replace(hour=h, minute=m) for (h,m) in BLOCK_ENDS_ET]
-    for i, s in enumerate(starts):
-        if t <= s:
-            return s, ends[i]
-    # past last start → tomorrow first block
-    tomorrow = t + dt.timedelta(days=1)
-    s = tomorrow.replace(hour=BLOCK_STARTS_ET[0][0], minute=BLOCK_STARTS_ET[0][1], second=0, microsecond=0)
-    e = tomorrow.replace(hour=BLOCK_ENDS_ET[0][0],   minute=BLOCK_ENDS_ET[0][1],   second=0, microsecond=0)
-    return s, e
-
-def sleep_until(dt_target, ping_sec=15):
-    while True:
-        now = now_ny()
-        if now >= dt_target: break
-        rem = int((dt_target - now).total_seconds())
-        print(f"[WAIT] {now.strftime('%H:%M:%S %Z')} → start {dt_target.strftime('%H:%M:%S %Z')}  ETA={rem}s")
-        time.sleep(min(ping_sec, max(1, rem)))
-
 # ================== ALPACA SETUP ==================
-print("=== [START] container up ===", utc_stamp())
+print("=== [START] container up ===", utc_ts())
 try:
     BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
     KEY_ID   = os.environ["APCA_API_KEY_ID"]
@@ -84,6 +77,10 @@ except KeyError as e:
 except Exception:
     traceback.print_exc(); sys.exit(2)
 
+# DriftWatch client
+dw = DriftWatchClient()
+DW_ENV = dw_env_from_base_url(BASE_URL)
+
 # ================== CORE ACTIONS ==================
 def latest_price(sym):
     try:
@@ -96,13 +93,15 @@ def latest_price(sym):
 def pos_qty(sym):
     try:
         p = api.get_position(sym)
-        q = int(p.qty);  return q if p.side=="long" else -q
+        q = int(p.qty)
+        return q if p.side == "long" else -q
     except Exception:
         return 0
 
 def market(sym, qty, tag):
-    if qty == 0: return
-    side = "buy" if qty>0 else "sell"
+    if qty == 0:
+        return
+    side = "buy" if qty > 0 else "sell"
     print(f"[ORDER] {side.upper()} {abs(qty)} {sym} @ MARKET  tag={tag}")
     api.submit_order(symbol=sym, qty=abs(qty), side=side, type="market", time_in_force="day")
 
@@ -113,19 +112,11 @@ def flatten(sym):
 
 # ========= STRATEGY HOOK (replace with your model) =========
 def predict_block_return_pct(sym, dt_block_start_et):
-    # Default returns 0 → no trade. In TEST_MODE we force a tiny signal.
     if TEST_MODE and sym == TEST_SYMBOL:
-        return 0.3   # pretend +0.3% over block → small long
+        return 0.3
     return 0.0
 
-# ================== RUN ONE BLOCK ==================
-# --- 1h block start/end anchored on the hour in ET ---
-def hour_window_after(t_et):
-    t = t_et.replace(minute=0, second=0, microsecond=0)
-    start = t if t_et.minute == 0 else (t + dt.timedelta(hours=1))
-    end   = start + dt.timedelta(hours=1)
-    return start, end
-
+# ================== RUN ONE SESSION (10→16 ET) ==================
 def run_session_6_hours(symbols):
     """Run six consecutive 1h trades from 10:00 ET to 16:00 ET."""
     dt_start = now_ny().replace(hour=10, minute=0, second=0, microsecond=0)
@@ -133,25 +124,77 @@ def run_session_6_hours(symbols):
 
     print(f"=== SESSION start {dt_start.strftime('%Y-%m-%d %H:%M ET')} → 16:00 ET ===")
 
+    # Track open trades for labeling
+    open_req_id = {}
+    open_entry_px = {}
+    open_entry_qty = {}
+
     for h in range(6):
         if h > 0:
             dt_start = dt_end
             dt_end = dt_start + dt.timedelta(hours=1)
 
+        block_id = dt_start.isoformat()
         print(f"--- 1h BLOCK {h+1}/6: {dt_start.strftime('%H:%M')}→{dt_end.strftime('%H:%M')} ET ---")
 
         # enter at block start
-        entries = {}
         for sym in symbols:
             px = latest_price(sym)
-            pred = predict_block_return_pct(sym, dt_start)   # predict next 1h
-            qty = 1 if pred > 0 else (-1 if pred < 0 else 0)
+
+            t0 = time.perf_counter()
+            pred = predict_block_return_pct(sym, dt_start)  # predict next 1h
+            latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
+
+            qty_target = 1 if pred > 0 else (-1 if pred < 0 else 0)
             cur = pos_qty(sym)
-            delta = qty - cur
-            print(f"[PLAN] {sym}: px={px} pred_1h={pred:.3f}% cur={cur} target={qty} delta={delta}")
+            delta = qty_target - cur
+
+            print(f"[PLAN] {sym}: px={px} pred_1h={pred:.3f}% cur={cur} target={qty_target} delta={delta}")
+
+            request_id = f"{block_id}|{sym}"
+
+            # DriftWatch inference event (always logs a decision attempt)
+            features_json = {k: None for k in DW_REQUIRED_FEATURE_KEYS}
+            features_json["pred_pct"] = _safe_float(pred)
+            features_json["p_up"] = 0.5 if pred == 0 else (0.6 if pred > 0 else 0.4)
+            features_json["px"] = _safe_float(px)
+            features_json["target_frac"] = _safe_float(qty_target)
+
+            segment_json = {
+                "sym": sym,
+                "timeframe": DW_TIMEFRAME,
+                "env": DW_ENV,
+                "session": "regular",
+                "block_id": block_id,
+                "block_minutes": 60,
+                "script": "Alpaca_live_blocks.py",
+            }
+
+            dw.log_inference(
+                model_id=DW_MODEL_ID,
+                model_version=DW_MODEL_VERSION,
+                ts=now_utc(),
+                pred_type="regression",
+                y_pred_num=_safe_float(pred),
+                y_pred_text=None,
+                latency_ms=latency_ms,
+                features_json=features_json,
+                segment_json=segment_json,
+                request_id=request_id,
+            )
+
+            # Place order if needed
             if delta != 0:
                 market(sym, delta, "enter_1h")
-            entries[sym] = px
+
+                # Track only if we now have a position
+                new_pos = pos_qty(sym)
+                if new_pos != 0:
+                    open_req_id[sym] = request_id
+                    open_entry_px[sym] = px
+                    open_entry_qty[sym] = new_pos
+
+        dw.flush()
 
         # monitor until hour end
         last_hb = 0
@@ -161,24 +204,46 @@ def run_session_6_hours(symbols):
                 print(f"[HB] {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')} → {dt_end.strftime('%H:%M:%S %Z')}")
                 last_hb = time.time()
 
-        # flatten all at end of each hour
+        # flatten all at end of each hour + log labels
         print("[EXIT] flattening hour positions...")
         for sym in symbols:
-            flatten(sym)
+            if pos_qty(sym) != 0:
+                exit_px = latest_price(sym)  # proxy
+                flatten(sym)
+
+                req_id = open_req_id.pop(sym, None)
+                entry_px = open_entry_px.pop(sym, None)
+                entry_qty = open_entry_qty.pop(sym, None)
+
+                if req_id and entry_px and entry_qty:
+                    # realized pnl% proxy
+                    if entry_qty > 0:
+                        pnl_pct = ((exit_px - entry_px) / entry_px) * 100.0
+                    else:
+                        pnl_pct = ((entry_px - exit_px) / entry_px) * 100.0
+
+                    dw.log_label(
+                        ts=now_utc(),
+                        request_id=req_id,
+                        y_true_num=_safe_float(pnl_pct),
+                        label_type="regression",
+                        extra_json={"label_name": "realized_pnl_pct", "entry_px": _safe_float(entry_px), "exit_px": _safe_float(exit_px)},
+                    )
+
+        dw.flush()
 
     print("[DONE] session complete (10→16 ET).")
-
-
 
 # ================== ENTRY POINT ==================
 if __name__ == "__main__":
     try:
         print("[MAIN] starting", utc_ts())
-        symbols = [TEST_SYMBOL] if TEST_MODE else ["AAPL","MSFT","PG","AMD","JPM","XOM"]
+        symbols = [TEST_SYMBOL] if TEST_MODE else ["AAPL", "MSFT", "PG", "AMD", "JPM", "XOM"]
         run_session_6_hours(symbols)
         print("[MAIN] exit", utc_ts())
         sys.exit(0)
     except Exception:
         traceback.print_exc()
         sys.exit(2)
-
+    finally:
+        dw.close()
