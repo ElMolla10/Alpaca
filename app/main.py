@@ -940,20 +940,24 @@ def run_session(api):
                         if k in feat_row.index:
                             features_json[k] = _to_float_or_none(feat_row[k])
 
+                block_id_utc = block_start.astimezone(timezone.utc).replace(microsecond=0) \
+                    .isoformat().replace("+00:00", "Z")
+
+                request_id = f"{block_id_utc}|{sym}"
+
                 segment_json = {
                     "sym": sym,
                     "timeframe": DW_TIMEFRAME,
                     "env": env,
                     "session": "regular",
-                    "block_id": block_id,
+                    "block_id": block_id_utc,
                     "block_minutes": BLOCK_MINUTES,
                 }
 
-                request_id = f"{block_id}|{sym}"
 
                 dw.log_inference(
-                    model_id=DW_MODEL_ID,
-                    model_version=DW_MODEL_VERSION,
+                    model_id="trading_ensemble_ret_1h",
+                    model_version="mock-v1",
                     ts=datetime.now(timezone.utc),
                     pred_type="regression",
                     y_pred_num=_to_float_or_none(pred),
@@ -961,7 +965,7 @@ def run_session(api):
                     latency_ms=latency_ms,
                     features_json=features_json,
                     segment_json=segment_json,
-                    request_id=request_id
+                    request_id=request_id,   # ✅ not None
                 )
 
                 px_print = px if (px and np.isfinite(px)) else float("nan")
