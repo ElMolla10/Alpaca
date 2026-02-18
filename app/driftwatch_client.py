@@ -1,7 +1,6 @@
 import os
 import time
 import math
-import json
 import logging
 import psycopg2
 from psycopg2.extras import Json
@@ -19,36 +18,44 @@ MAX_RETRIES = 5
 CONNECT_TIMEOUT = 3
 STATEMENT_TIMEOUT = "3000ms"
 
+
 class DriftWatchClient:
     def __init__(self):
         self.enabled = os.getenv("DRIFTWATCH_ENABLED", "true").lower() == "true"
         self.dsn = os.getenv("DRIFTWATCH_DATABASE_URL")
-        
+
         # Buffer configs
         try:
-            self.batch_size = int(os.getenv("DRIFTWATCH_BATCH_SIZE", DEFAULT_BATCH_SIZE))
-            self.flush_seconds = int(os.getenv("DRIFTWATCH_FLUSH_SECONDS", DEFAULT_FLUSH_SECONDS))
+            self.batch_size = int(os.getenv("DRIFTWATCH_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+            self.flush_seconds = int(os.getenv("DRIFTWATCH_FLUSH_SECONDS", str(DEFAULT_FLUSH_SECONDS)))
         except ValueError:
             self.batch_size = DEFAULT_BATCH_SIZE
             self.flush_seconds = DEFAULT_FLUSH_SECONDS
 
+        # Buffers
+        self.infer_buffer = deque(maxlen=MAX_BUFFER)
+        self.label_buffer = deque(maxlen=MAX_BUFFER)
+
         # State
-        self.buffer = deque(maxlen=MAX_BUFFER)
         self.last_flush_time = time.time()
-        
+
         # Counters
         self.dropped_events = 0
         self.flush_failures = 0
         self.insert_success = 0
+        self.label_insert_success = 0
 
         if self.enabled and not self.dsn:
             logger.warning("DriftWatch enabled but DRIFTWATCH_DATABASE_URL missing. Disabling.")
             self.enabled = False
 
         if self.enabled:
-            logger.info("DriftWatchClient initialized. Batch=%d, Flush=%ds", 
-                        self.batch_size, self.flush_seconds)
-    
+            logger.info(
+                "DriftWatchClient initialized. Batch=%d, Flush=%ds",
+                self.batch_size,
+                self.flush_seconds
+            )
+
     def _sanitize(self, val: Any) -> Any:
         """Sanitize numeric values: NaN/Inf -> None."""
         if val is None:
@@ -74,7 +81,6 @@ class DriftWatchClient:
         if not self.enabled:
             return
 
-        # Sanitize features and segment numbers
         clean_features = {k: self._sanitize(v) for k, v in features_json.items()}
         clean_segment = {k: self._sanitize(v) for k, v in segment_json.items()}
 
@@ -88,71 +94,124 @@ class DriftWatchClient:
             Json(clean_features),
             self._sanitize(y_pred_num),
             y_pred_text,
-            Json(clean_segment)
+            Json(clean_segment),
         )
-        
-        # Add to buffer (auto-drops oldest if full per deque maxlen)
-        if len(self.buffer) == MAX_BUFFER:
+
+        if len(self.infer_buffer) == MAX_BUFFER:
             self.dropped_events += 1
-            
-        self.buffer.append(event)
-        
-        # Check for flush
-        if (len(self.buffer) >= self.batch_size) or \
+
+        self.infer_buffer.append(event)
+
+        if (len(self.infer_buffer) >= self.batch_size) or \
+           ((time.time() - self.last_flush_time) >= self.flush_seconds):
+            self.flush()
+
+    def log_label(
+        self,
+        ts: datetime,
+        request_id: str,
+        y_true_num: Optional[float],
+        y_true_text: Optional[str] = None,
+        label_type: str = "regression",
+        extra_json: Optional[Dict[str, Any]] = None
+    ):
+        if not self.enabled:
+            return
+
+        clean_extra = {k: self._sanitize(v) for k, v in (extra_json or {}).items()}
+
+        event = (
+            ts,
+            request_id,
+            self._sanitize(y_true_num),
+            y_true_text,
+            label_type,
+            Json(clean_extra),
+        )
+
+        if len(self.label_buffer) == MAX_BUFFER:
+            self.dropped_events += 1
+
+        self.label_buffer.append(event)
+
+        if (len(self.label_buffer) >= self.batch_size) or \
            ((time.time() - self.last_flush_time) >= self.flush_seconds):
             self.flush()
 
     def flush(self):
-        if not self.enabled or not self.buffer:
+        if not self.enabled:
             return
 
-        batch = []
-        # Pop a batch
-        while self.buffer and len(batch) < self.batch_size:
-            batch.append(self.buffer.popleft())
-            
-        if not batch:
+        # Build batches
+        infer_batch = []
+        while self.infer_buffer and len(infer_batch) < self.batch_size:
+            infer_batch.append(self.infer_buffer.popleft())
+
+        label_batch = []
+        while self.label_buffer and len(label_batch) < self.batch_size:
+            label_batch.append(self.label_buffer.popleft())
+
+        if not infer_batch and not label_batch:
             return
-            
+
         success = False
         wait = 0.5
-        
-        # Retry loop
+
         for attempt in range(MAX_RETRIES):
             try:
                 with psycopg2.connect(self.dsn, connect_timeout=CONNECT_TIMEOUT) as conn:
                     with conn.cursor() as cur:
-                        # Transaction-scoped timeout
                         cur.execute(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'")
-                        
-                        sql = """
-                        INSERT INTO inference_events 
-                        (ts, model_id, model_version, request_id, pred_type, latency_ms, features_json, y_pred_num, y_pred_text, segment_json)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """
-                        cur.executemany(sql, batch)
+
+                        if infer_batch:
+                            sql_i = """
+                                INSERT INTO inference_events
+                                (ts, model_id, model_version, request_id, pred_type, latency_ms,
+                                 features_json, y_pred_num, y_pred_text, segment_json)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """
+                            cur.executemany(sql_i, infer_batch)
+                            self.insert_success += len(infer_batch)
+
+                        if label_batch:
+                            sql_l = """
+                                INSERT INTO label_events
+                                (ts, request_id, y_true_num, y_true_text, label_type, extra_json)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                            """
+                            cur.executemany(sql_l, label_batch)
+                            self.label_insert_success += len(label_batch)
+
                     conn.commit()
-                
+
                 success = True
-                self.insert_success += len(batch)
                 self.last_flush_time = time.time()
-                break  # Success
-                
+                break
+
             except (psycopg2.Error, OSError) as e:
-                logger.warning(f"DriftWatch flush attempt {attempt+1}/{MAX_RETRIES} failed: {e}")
+                logger.warning("DriftWatch flush attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(wait)
                     wait *= 2
-        
+
         if not success:
             self.flush_failures += 1
-            logger.error("DriftWatch flush failed after retries. Dropping batch.")
-            # Note: Batch is already popped from buffer, so it is dropped effectively.
+            logger.error(
+                "DriftWatch flush failed after retries. Dropping batches (infer=%d, label=%d).",
+                len(infer_batch),
+                len(label_batch),
+            )
+            # batches already popped -> dropped
 
     def close(self):
         """Force flush remaining events on exit."""
-        if self.enabled:
-            logger.info("DriftWatch closing. Flushing remaining %d events...", len(self.buffer))
-            # Flush everything in batches
-            while self.buffer:
-                self.flush()
+        if not self.enabled:
+            return
+
+        logger.info(
+            "DriftWatch closing. Flushing remaining infer=%d label=%d ...",
+            len(self.infer_buffer),
+            len(self.label_buffer),
+        )
+        while self.infer_buffer or self.label_buffer:
+            self.flush()
