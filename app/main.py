@@ -680,6 +680,7 @@ def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) 
 def run_session(api):
     dw = DriftWatchClient()
     state = load_state()
+    state.setdefault("open_req_id", {})
     today = now_ny().strftime("%Y-%m-%d")
     if state.get("last_day") != today:
         state = {
@@ -716,6 +717,9 @@ def run_session(api):
     agent_style.max_symbols = AGENT_MAX_SYMBOLS
     agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
     print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
+    
+    ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
+
 
     t_now = now_ny()
     session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
@@ -750,7 +754,6 @@ def run_session(api):
             print("[INFO] Reached session close window; stopping.")
             break
 
-        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
 
         # Use BLOCK_MINUTES instead of fixed 1h
         unclamped_end = block_start + dt.timedelta(minutes=BLOCK_MINUTES)
@@ -940,7 +943,16 @@ def run_session(api):
                 px_print = px if (px and np.isfinite(px)) else float("nan")
                 print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% p_up={sig['p_up']:.3f} vol_est={sig['vol_est']:.4f} target_pos={target_frac:+.3f}")
 
+                before_n = ledger.fills_count(sym)
                 submit_target(api, sym, target_frac, eq, px, ledger=ledger)
+                after_n = ledger.fills_count(sym)
+
+                submitted = after_n > before_n
+
+                # store request_id only for a real new entry
+                if submitted and is_new_entry:
+                    state["open_req_id"][sym] = request_id
+
 
                 absf = abs(target_frac)
                 if dec.hold_min_blocks is not None:
@@ -964,29 +976,52 @@ def run_session(api):
                 print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
                 last_hb = time.time()
 
-        pnl_pct_by_symbol = ledger.compute_block_pnl_pct()
-        agent.update_rewards(pnl_pct_by_symbol)
-        state["agent"] = agent.export_state()
-        save_state(state)
-
         print("[EXIT] flattening block positions...", flush=True)
-                print("[EXIT] flattening block positions...", flush=True)
+
+        closed_pnl = {}  # symbol -> pnl_pct for rewards
         for sym in SYMBOLS:
             rem = int(state.get("hold_timer", {}).get(sym, 0))
             if rem <= 1:
                 print(f"[FLATTEN] {sym}: closing position (timer expired)")
+
+                # close + record exit fill into persistent ledger
                 flatten(api, sym, ledger=ledger)
                 state["hold_timer"][sym] = 0
+
+                # compute realized pnl% for this symbol (entry+exit across blocks)
+                pnl_pct = ledger.compute_symbol_pnl_pct(sym)
+                ledger.clear_symbol(sym)
+
+                if pnl_pct is not None:
+                    closed_pnl[sym] = float(pnl_pct)
+
+                # DriftWatch label: join via request_id saved at entry time
+                req_id = state.get("open_req_id", {}).pop(sym, None)
+                if req_id is not None and pnl_pct is not None:
+                    dw.log_label(
+                        ts=datetime.now(timezone.utc),
+                        request_id=req_id,
+                        y_true_num=float(pnl_pct),
+                        label_type="regression",
+                        extra_json={"label_name": "realized_pnl_pct"}
+                    )
+
             else:
                 state["hold_timer"][sym] = rem - 1
                 print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
 
+        # update RL rewards only for symbols that actually closed
+        if closed_pnl:
+            agent.update_rewards(closed_pnl)
+
+        state["agent"] = agent.export_state()
         save_state(state)
 
-        # DriftWatch: end-of-block flush (safe even if buffer is empty)
+        # DriftWatch: end-of-block flush
         dw.flush()
 
         block_start = block_end
+
 
 
 # =================== ENTRY ===================
