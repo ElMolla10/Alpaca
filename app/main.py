@@ -917,6 +917,13 @@ def run_session(api):
                     for k in features_json.keys():
                         if k in ("pred_pct", "p_up", "sigma20_pct", "px", "target_frac"):
                             continue
+                
+                        # Map model's lag1 feature into DriftWatch's canonical "price_change_pct"
+                        if k == "price_change_pct":
+                            if "price_change_pct_lag1" in feat_row.index:
+                                features_json["price_change_pct"] = _to_float_or_none(feat_row["price_change_pct_lag1"])
+                            continue
+                
                         if k in feat_row.index:
                             features_json[k] = _to_float_or_none(feat_row[k])
 
