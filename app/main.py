@@ -568,26 +568,29 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
         if c not in df.columns:
             df[c] = 0.0
 
+    # === FIX 1) fetch_recent_features(): REPLACE the tail starting from `cols = ...` down to `return df` with this ===
+
     cols = ["timestamp"] + [c for c in FEAT_COLS if c in df.columns]
+
     # Keep sigma20_pct alongside features for vol_est, but not as a model feature
     if "sigma20_pct" in df.columns and "sigma20_pct" not in cols:
         cols.append("sigma20_pct")
 
-        # --- Ensure DriftWatch raw feature columns are present in returned df ---
+    # Ensure DriftWatch raw feature columns are present in returned df (for feat_row snapshot)
     DW_RAW_FROM_DF = [
-        "sigma20_pct", "price_change_pct", "ret5", "vol20",
+        "sigma20_pct", "price_change_pct", "price_change_pct_lag1", "ret5", "vol20",
         "MACDh_12_26_9", "BBM_20_2.0",
         "price_change_pct_lag2", "price_change_pct_lag3",
         "MACDh_12_26_9_lag2", "MACDh_12_26_9_lag3",
-        "BBM_20_2.0_lag2", "BBM_20_2.0_lag3"
+        "BBM_20_2.0_lag2", "BBM_20_2.0_lag3",
     ]
     for c in DW_RAW_FROM_DF:
         if c in df.columns and c not in cols:
             cols.append(c)
 
-
     df = df[cols]
     return df
+
 
 def map_signal_to_pos(pred_pct: float, band_R: float, exp_: float) -> float:
     s = float(pred_pct) / max(1e-12, band_R)
@@ -612,14 +615,15 @@ def target_position_from_pred(pred_pct_live: float, band_R: float, hl: int, sym:
     state["pos_ema"][sym] = pos
     return pos
 
+# === FIX 2) predict_block_signal(): REPLACE the whole function with this ===
+
 def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) -> dict:
     """
-    Returns an enriched prediction dict:
+    Returns:
       - pred_pct: ensemble mean predicted 1h return in %
       - p_up: pseudo probability of up move (0..1)
       - vol_est: latest sigma20_pct
       - per_model: individual model outputs
-    Trading loop currently only uses pred_pct; p_up/vol_est are for future RL logic.
     """
     out = {
         "pred_pct": 0.0,
@@ -628,8 +632,9 @@ def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) 
         "per_model": {"xgb": None, "elastic": None}
     }
     try:
-        df = df_override if df_override is not None else fetch_recent_features(api, sym)
+        df = df_override if (df_override is not None and not df_override.empty) else fetch_recent_features(api, sym)
         if df is None or df.empty:
+            return out
 
         X = df[FEAT_COLS].astype(float).iloc[-1:].values
         last_ts = df["timestamp"].iloc[-1] if "timestamp" in df.columns else "n/a"
@@ -664,15 +669,14 @@ def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) 
         pred_mean = float(np.mean(preds))
         out["pred_pct"] = pred_mean
 
-        # Map mean prediction to a pseudo probability p_up using vol_est as a scale
+        # pseudo prob from z-score-ish
         if np.isfinite(pred_mean):
             if np.isfinite(vol_est) and vol_est > 1e-6:
                 z = pred_mean / max(1.0, vol_est)
             else:
                 z = pred_mean / 1.0
             z = float(np.clip(z, -5.0, 5.0))
-            p_up = 1.0 / (1.0 + math.exp(-z))
-            out["p_up"] = float(p_up)
+            out["p_up"] = float(1.0 / (1.0 + math.exp(-z)))
 
         print(f"[DBG] {sym}: ensemble_pred={pred_mean:.4f}% p_up={out['p_up']:.3f} vol_est={out['vol_est']}")
         return out
@@ -681,375 +685,343 @@ def predict_block_signal(api: REST, sym: str, df_override: pd.DataFrame = None) 
         print(f"[ERR] predict_block_signal {sym}: {e}")
         return out
 
+
 # =================== MAIN LOOP ===================
+# === FIX 3) run_session(): REPLACE ONLY the function run_session(api) with this ===
+
 def run_session(api):
-    from app.driftwatch_client import DriftWatchClient
     dw = DriftWatchClient()
+
     try:
+        # ---- state init (FIX: keep dw alive for whole session) ----
         state = load_state()
-        state.setdefault("open_req_id", {})
         today = now_ny().strftime("%Y-%m-%d")
 
         if state.get("last_day") != today:
             state = {
                 "pos_ema": {},
                 "hold_timer": {},
-                "open_req_id": {},              # ✅ keep inside state on new day
+                "open_req_id": {},
                 "last_day": today,
-                "agent": state.get("agent", {}) # persist agent learning across days
+                "agent": state.get("agent", {})
             }
             save_state(state)
-        else:
-            state.setdefault("open_req_id", {})  # ✅ ensure exists on same day
+
+        state.setdefault("open_req_id", {})
+        state.setdefault("hold_timer", {})
+        state.setdefault("pos_ema", {})
+        state.setdefault("agent", {})
 
         acct = api.get_account()
         print(f"[ACCT] status={acct.status} equity=${acct.equity} bp=${acct.buying_power}")
 
-        # ... keep the rest of your existing run_session code here ...
+        # === Daily drawdown tracking ===
+        day_start_equity = account_equity(api)
+        throttled = False
+
+        ensure_market_open_or_wait(api)
+
+        if LONGS_ONLY:
+            try:
+                for p in api.list_positions():
+                    qty = float(getattr(p, "qty", 0.0))
+                    sym = getattr(p, "symbol", "")
+                    if qty < 0:
+                        print(f"[LONGS_ONLY] Covering pre-existing short: {sym} qty={qty}")
+                        api.submit_order(symbol=sym, qty=abs(qty), side="buy", type="market", time_in_force="day")
+                        state["hold_timer"][sym] = 0
+                save_state(state)
+            except Exception as e:
+                print(f"[LONGS_ONLY_ERR] pre-open cover: {e}")
+
+        agent_style = default_style(USER_STYLE)
+        agent_style.max_symbols = AGENT_MAX_SYMBOLS
+        agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
+        print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
+
+        ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
+
+        t_now = now_ny()
+        session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
+        session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
+        block_start   = t_now if t_now >= session_open else session_open
+
+        b = 0
+        while True:
+            # 1) EOD check
+            mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
+            if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
+                print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
+                try:
+                    for p in api.list_positions():
+                        sym = getattr(p, "symbol", None)
+                        if sym:
+                            flatten(api, sym, ledger=None)
+                except Exception as e:
+                    print(f"[EOD_WARN] list_positions/flatten: {e}")
+
+                for sym in SYMBOLS:
+                    state["hold_timer"][sym] = 0
+                save_state(state)
+
+                print("[EOD] All positions flattened. Ending session loop.")
+                break
+
+            # 2) session close
+            if block_start >= session_close:
+                print("[INFO] Reached session close window; stopping.")
+                break
+
+            unclamped_end = block_start + dt.timedelta(minutes=BLOCK_MINUTES)
+            block_end = min(unclamped_end, session_close)
+
+            env = dw_env_from_base_url(BASE_URL)
+
+            secs_left = (session_close - block_start).total_seconds()
+            blocks_left = max(1, math.ceil(secs_left / float(BLOCK_SECONDS)))
+            b += 1
+
+            print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET (block={BLOCK_MINUTES}min) ===")
+            print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
+
+            eq_now = account_equity(api)
+            if day_start_equity > 0:
+                dd_day = 100.0 * (eq_now - day_start_equity) / day_start_equity
+
+                if dd_day <= -abs(DAY_KILL_DD_PCT):
+                    print(f"[KILL] Daily PnL {dd_day:.2f}% ≤ -{DAY_KILL_DD_PCT:.2f}% → flatten and stop.")
+                    for p in api.list_positions():
+                        sym = getattr(p, "symbol", None)
+                        if sym:
+                            flatten(api, sym, ledger=None)
+                    break
+
+                if (not throttled) and dd_day <= -abs(DAY_THROTTLE_DD_PCT):
+                    throttled = True
+                    print(f"[THROTTLE] Daily PnL {dd_day:.2f}% ≤ -{DAY_THROTTLE_DD_PCT:.2f}% → reducing size ×{THROTTLE_SIZE_MULT:.2f}")
+
+            is_fri, ny_hour = is_friday_ny()
+            is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
+            friday_mult = 1.0
+            if is_fri:
+                friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
+                print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
+
+            # >>> AGENT 3.3 BEGIN
+            sym_to_df = {}
+            for s in SYMBOLS:
+                try:
+                    sym_to_df[s] = fetch_recent_features(api, s, lookback_days=agent_style.lookback_days)
+                except Exception:
+                    sym_to_df[s] = None
+
+            feats = agent.build_selection_frame(sym_to_df)
+            trade_universe = set(agent.select_universe(feats)) if AGENTIC_MODE else set(SYMBOLS)
+            print(f"[AGENT] universe this block: {sorted(list(trade_universe))}")
+            # >>> AGENT 3.3 END
+
+            price_cache = {}
+
+            for sym in SYMBOLS:
+                try:
+                    minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
+                    cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
+
+                    rem = int(state.get("hold_timer", {}).get(sym, 0))
+                    if rem > 0:
+                        print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
+                        continue
+
+                    if AGENTIC_MODE and (sym not in trade_universe):
+                        print(f"[AGENT] {sym}: not selected this block → skip")
+                        continue
+
+                    ctx = BlockContext(
+                        is_friday=is_fri,
+                        is_late=is_late,
+                        minutes_to_close=minutes_to_close,
+                        equity=float(eq_now)
+                    )
+                    dec = agent.decide_for_symbol(sym, ctx)
+                    if not dec.allow:
+                        print(f"[AGENT] {sym}: decision=blocked")
+                        continue
+
+                    if cutoff_active:
+                        print(f"[CUTOFF] {sym}: {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min to close → blocking NEW entry.")
+                        continue
+
+                    px = price_cache.get(sym)
+                    if px is None:
+                        px = latest_price(api, sym)
+                        price_cache[sym] = px
+
+                    # --- inference once (FIX: remove duplicate predict + bad indentation) ---
+                    t0 = time.perf_counter()
+                    df_feat = sym_to_df.get(sym)
+                    sig = predict_block_signal(api, sym, df_override=df_feat)
+                    pred = sig["pred_pct"] * SIGN_MULT
+                    latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
+
+                    if pred == 0.0:
+                        print(f"[WARN] {sym}: prediction is 0.0 (check features/models)")
+
+                    band_R_used = dec.band_R_override if dec.band_R_override is not None else BAND_R
+                    ema_hl_used = dec.ema_hl_override if dec.ema_hl_override is not None else EMA_HALF_LIFE
+
+                    target_frac = target_position_from_pred(pred, band_R_used, ema_hl_used, sym, state)
+
+                    if dec.size_mult and target_frac != 0.0:
+                        target_frac *= float(dec.size_mult)
+                        print(f"[AGENT] {sym}: size×={dec.size_mult:.2f} → target_pos={target_frac:+.3f}")
+
+                    sym_mult = PER_SYMBOL_SIZE_MULT.get(sym, 1.0)
+                    if sym_mult != 1.0 and target_frac != 0.0:
+                        target_frac *= sym_mult
+                        print(f"[SIZE]  {sym}: per-symbol×={sym_mult:.2f} → target_pos={target_frac:+.3f}")
+
+                    if is_fri and friday_mult < 1.0 and target_frac != 0.0:
+                        target_frac *= friday_mult
+                        print(f"[FRIDAY] {sym}: size×={friday_mult:.2f} → target_pos={target_frac:+.3f}")
+
+                    per_sym_cap_frac = max(1e-9, PER_SYM_GROSS_CAP)
+                    if abs(target_frac) > per_sym_cap_frac:
+                        target_frac = math.copysign(per_sym_cap_frac, target_frac)
+                        print(f"[CAP] {sym}: target clipped to per-sym cap frac={per_sym_cap_frac:.3f}")
+
+                    if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and abs(target_frac) >= MIN_ABS_POS:
+                        print(f"[FRIDAY] {sym}: blocking NEW entry after {FRIDAY_LATE_CUTOFF_H}:00 ET.")
+                        continue
+
+                    if throttled and target_frac != 0.0:
+                        target_frac *= THROTTLE_SIZE_MULT
+                        print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
+
+                    # --- DriftWatch inference event (FIX: request_id never null, use df_feat snapshot) ---
+                    feat_row = None
+                    if df_feat is not None and not df_feat.empty:
+                        feat_row = df_feat.iloc[-1]
+
+                    features_json = {k: None for k in DW_REQUIRED_FEATURE_KEYS}
+                    features_json["pred_pct"] = _to_float_or_none(pred)
+                    features_json["p_up"] = _to_float_or_none(sig.get("p_up"))
+                    features_json["sigma20_pct"] = _to_float_or_none(sig.get("vol_est"))
+                    features_json["px"] = _to_float_or_none(px)
+                    features_json["target_frac"] = _to_float_or_none(target_frac)
+
+                    if feat_row is not None:
+                        for k in list(features_json.keys()):
+                            if k in ("pred_pct", "p_up", "sigma20_pct", "px", "target_frac"):
+                                continue
+
+                            # Map lag1 into canonical price_change_pct
+                            if k == "price_change_pct":
+                                if "price_change_pct_lag1" in feat_row.index:
+                                    features_json["price_change_pct"] = _to_float_or_none(feat_row["price_change_pct_lag1"])
+                                continue
+
+                            if k in feat_row.index:
+                                features_json[k] = _to_float_or_none(feat_row[k])
+
+                    block_id_utc = block_start.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    request_id = f"{block_id_utc}|{sym}"
+
+                    segment_json = {
+                        "sym": sym,
+                        "timeframe": DW_TIMEFRAME,
+                        "env": env,
+                        "session": "regular",
+                        "block_id": block_id_utc,
+                        "block_minutes": BLOCK_MINUTES,
+                    }
+
+                    dw.log_inference(
+                        model_id=DW_MODEL_ID,
+                        model_version=DW_MODEL_VERSION,
+                        ts=datetime.now(timezone.utc),
+                        pred_type="regression",
+                        y_pred_num=_to_float_or_none(pred),
+                        y_pred_text=None,
+                        latency_ms=latency_ms,
+                        features_json=features_json,
+                        segment_json=segment_json,
+                        request_id=request_id,
+                    )
+
+                    px_print = px if (px and np.isfinite(px)) else float("nan")
+                    print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% p_up={sig['p_up']:.3f} vol_est={sig['vol_est']:.4f} target_pos={target_frac:+.3f}")
+
+                    before_n = ledger.fills_count(sym)
+                    submit_target(api, sym, target_frac, float(eq_now), px, ledger=ledger)
+                    submitted = ledger.fills_count(sym) > before_n
+
+                    # FIX: only set timers + open_req_id if an order actually submitted
+                    if submitted:
+                        state["open_req_id"][sym] = request_id
+
+                        absf = abs(target_frac)
+                        if dec.hold_min_blocks is not None:
+                            hold_blocks = int(max(1, dec.hold_min_blocks))
+                        else:
+                            if absf < 0.25:   hold_blocks = 1
+                            elif absf < 0.50: hold_blocks = 2
+                            else:             hold_blocks = 3
+                        state["hold_timer"][sym] = hold_blocks
+
+                except Exception as e:
+                    print(f"[ERR] {sym}: {e}")
+                    traceback.print_exc(limit=1)
+
+            save_state(state)
+
+            last_hb = 0
+            while now_ny() < block_end:
+                time.sleep(10)
+                if time.time() - last_hb >= 60:
+                    print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
+                    last_hb = time.time()
+
+            print("[EXIT] flattening block positions...", flush=True)
+
+            closed_pnl = {}
+            for sym in SYMBOLS:
+                rem = int(state.get("hold_timer", {}).get(sym, 0))
+                if rem <= 1:
+                    print(f"[FLATTEN] {sym}: closing position (timer expired)")
+
+                    flatten(api, sym, ledger=ledger)
+                    state["hold_timer"][sym] = 0
+
+                    pnl_pct = ledger.compute_symbol_pnl_pct(sym)
+                    ledger.clear_symbol(sym)
+
+                    if pnl_pct is not None:
+                        closed_pnl[sym] = float(pnl_pct)
+
+                    req_id = state.get("open_req_id", {}).pop(sym, None)
+                    if req_id is not None and pnl_pct is not None:
+                        dw.log_label(
+                            ts=datetime.now(timezone.utc),
+                            request_id=req_id,
+                            y_true_num=float(pnl_pct),
+                            label_type="regression",
+                            extra_json={"label_name": "realized_pnl_pct"}
+                        )
+                else:
+                    state["hold_timer"][sym] = rem - 1
+                    print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
+
+            if closed_pnl:
+                agent.update_rewards(closed_pnl)
+
+            state["agent"] = agent.export_state()
+            save_state(state)
+
+            dw.flush()
+            block_start = block_end
 
     finally:
         dw.close()
-
-
-    # === Daily drawdown tracking ===
-    day_start_equity = account_equity(api)
-    throttled = False
-
-    ensure_market_open_or_wait(api)
-
-    if LONGS_ONLY:
-        try:
-            for p in api.list_positions():
-                qty = float(getattr(p, "qty", 0.0))
-                sym = getattr(p, "symbol", "")
-                if qty < 0:
-                    print(f"[LONGS_ONLY] Covering pre-existing short: {sym} qty={qty}")
-                    api.submit_order(symbol=sym, qty=abs(qty), side="buy", type="market", time_in_force="day")
-                    state.setdefault("hold_timer", {})[sym] = 0
-            save_state(state)
-        except Exception as e:
-            print(f"[LONGS_ONLY_ERR] pre-open cover: {e}")
-
-    agent_style = default_style(USER_STYLE)
-    agent_style.max_symbols = AGENT_MAX_SYMBOLS
-    agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
-    print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
-    
-    ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
-
-
-    t_now = now_ny()
-    session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-    session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
-    block_start   = t_now if t_now >= session_open else session_open
-
-    b = 0
-    while True:
-
-        # 1) Always check EOD first based on *actual time*
-        mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
-        if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
-            print(f"[EOD] {EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f} min to close → flattening all open positions.")
-            try:
-                for p in api.list_positions():
-                    sym = getattr(p, "symbol", None)
-                    if sym:
-                        flatten(api, sym, ledger=None)
-            except Exception as e:
-                print(f"[EOD_WARN] list_positions/flatten: {e}")
-
-            # Reset timers
-            for sym in SYMBOLS:
-                state.setdefault("hold_timer", {})[sym] = 0
-            save_state(state)
-
-            print("[EOD] All positions flattened. Ending session loop.")
-            break
-
-        # 2) Then check if we’re beyond session_close
-        if block_start >= session_close:
-            print("[INFO] Reached session close window; stopping.")
-            break
-
-
-        # Use BLOCK_MINUTES instead of fixed 1h
-        unclamped_end = block_start + dt.timedelta(minutes=BLOCK_MINUTES)
-        block_end = min(unclamped_end, session_close)
-        
-        block_id = block_start.isoformat()  # ET offset included
-        env = dw_env_from_base_url(BASE_URL)
-
-        secs_left = (session_close - block_start).total_seconds()
-        blocks_left = max(1, math.ceil(secs_left / float(BLOCK_SECONDS)))
-        b += 1
-
-        print(f"\n=== BLOCK {b}/{blocks_left} {block_start.strftime('%H:%M')}→{block_end.strftime('%H:%M')} ET (block={BLOCK_MINUTES}min) ===")
-        print(f"[TIMECHK] now={now_ny().strftime('%H:%M:%S %Z')} block_end={block_end.strftime('%H:%M:%S %Z')}", flush=True)
-
-        eq = account_equity(api)
-        eq_now = account_equity(api)
-        if day_start_equity > 0:
-            dd_day = 100.0 * (eq_now - day_start_equity) / day_start_equity
-
-            # Kill switch
-            if dd_day <= -abs(DAY_KILL_DD_PCT):
-                print(f"[KILL] Daily PnL {dd_day:.2f}% ≤ -{DAY_KILL_DD_PCT:.2f}% → flatten and stop.")
-                for p in api.list_positions():
-                    sym = getattr(p, "symbol", None)
-                    if sym:
-                        flatten(api, sym, ledger=None)
-                break
-
-            # Throttle
-            if (not throttled) and dd_day <= -abs(DAY_THROTTLE_DD_PCT):
-                throttled = True
-                print(f"[THROTTLE] Daily PnL {dd_day:.2f}% ≤ -{DAY_THROTTLE_DD_PCT:.2f}% → reducing size ×{THROTTLE_SIZE_MULT:.2f}")
-
-        is_fri, ny_hour = is_friday_ny()
-        is_late = is_fri and (ny_hour >= FRIDAY_LATE_CUTOFF_H)
-        friday_mult = 1.0
-        if is_fri:
-            friday_mult = FRIDAY_SIZE_MULT_LATE if is_late else FRIDAY_SIZE_MULT_DAY
-            print(f"[FRIDAY] context: hour={ny_hour}, late={is_late}, size_mult={friday_mult:.2f}, block_new_after_late={FRIDAY_BLOCK_NEW_AFTER_LATE}")
-
-        # >>> AGENT 3.3 BEGIN
-        sym_to_df = {}
-        for s in SYMBOLS:
-            try:
-                sym_to_df[s] = fetch_recent_features(api, s, lookback_days=agent_style.lookback_days)
-            except Exception:
-                sym_to_df[s] = None
-        feats = agent.build_selection_frame(sym_to_df)
-        trade_universe = set(agent.select_universe(feats)) if AGENTIC_MODE else set(SYMBOLS)
-        print(f"[AGENT] universe this block: {sorted(list(trade_universe))}")
-        # >>> AGENT 3.3 END
-
-        price_cache = {}
-
-        for sym in SYMBOLS:
-            try:
-                minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
-                cutoff_active = minutes_to_close <= TRADE_CUTOFF_MIN_BEFORE_CLOSE
-
-                rem = int(state.get("hold_timer", {}).get(sym, 0))
-                if rem > 0:
-                    print(f"[HOLD] {sym}: already open; {rem} block(s) remaining. Skipping new order.")
-                    continue
-
-                if AGENTIC_MODE and (sym not in trade_universe):
-                    print(f"[AGENT] {sym}: not selected this block → skip")
-                    continue
-
-                ctx = BlockContext(
-                    is_friday=is_fri,
-                    is_late=is_late,
-                    minutes_to_close=minutes_to_close,
-                    equity=eq
-                )
-                dec = agent.decide_for_symbol(sym, ctx)
-                if not dec.allow:
-                    print(f"[AGENT] {sym}: decision=blocked")
-                    continue
-
-                if cutoff_active and rem == 0:
-                    print(f"[CUTOFF] {sym}: {TRADE_CUTOFF_MIN_BEFORE_CLOSE} min to close → blocking NEW entry.")
-                    continue
-
-                print(f"[DBG] fetching & predicting {sym} ...", flush=True)
-                px = price_cache.get(sym)
-                if px is None:
-                    px = latest_price(api, sym)
-                    price_cache[sym] = px
-
-                sig = predict_block_signal(api, sym)
-                pred = sig["pred_pct"] * SIGN_MULT  # still 1h prediction, used every BLOCK_MINUTES
-
-                if pred == 0.0:
-                    print(f"[WARN] {sym}: prediction is 0.0 (check features/models)")
-
-                band_R_used = dec.band_R_override if dec.band_R_override is not None else BAND_R
-                ema_hl_used = dec.ema_hl_override if dec.ema_hl_override is not None else EMA_HALF_LIFE
-
-                target_frac = target_position_from_pred(pred, band_R_used, ema_hl_used, sym, state)
-                if dec.size_mult and target_frac != 0.0:
-                    target_frac *= float(dec.size_mult)
-                    print(f"[AGENT] {sym}: size×={dec.size_mult:.2f} → target_pos={target_frac:+.3f}")
-
-                sym_mult = PER_SYMBOL_SIZE_MULT.get(sym, 1.0)
-                if sym_mult != 1.0 and target_frac != 0.0:
-                    target_frac *= sym_mult
-                    print(f"[SIZE]  {sym}: per-symbol×={sym_mult:.2f} → target_pos={target_frac:+.3f}")
-
-                if is_fri and friday_mult < 1.0 and target_frac != 0.0:
-                    target_frac *= friday_mult
-                    print(f"[FRIDAY] {sym}: size×={friday_mult:.2f} → target_pos={target_frac:+.3f}")
-
-                per_sym_cap_frac = max(1e-9, PER_SYM_GROSS_CAP)
-                if abs(target_frac) > per_sym_cap_frac:
-                    target_frac = math.copysign(per_sym_cap_frac, target_frac)
-                    print(f"[CAP] {sym}: target clipped to per-sym cap frac={per_sym_cap_frac:.3f}")
-
-                prev_pos = float(state.get("pos_ema", {}).get(sym, 0.0))
-                is_new_entry = (abs(prev_pos) < MIN_ABS_POS) and (abs(target_frac) >= MIN_ABS_POS)
-                if is_fri and is_late and FRIDAY_BLOCK_NEW_AFTER_LATE and is_new_entry:
-                    print(f"[FRIDAY] {sym}: blocking NEW entry after {FRIDAY_LATE_CUTOFF_H}:00 ET.")
-                    continue
-
-                if throttled and target_frac != 0.0:
-                    target_frac *= THROTTLE_SIZE_MULT
-                    print(f"[THROTTLE] {sym}: size×={THROTTLE_SIZE_MULT:.2f} → target_pos={target_frac:+.3f}")
-
-                                # --- DriftWatch logging (inference + decision latency only) ---
-                t0 = time.perf_counter()
-
-                # reuse the df already fetched for agent selection
-                df_feat = sym_to_df.get(sym)
-                sig = predict_block_signal(api, sym, df_override=df_feat)
-
-                pred = sig["pred_pct"] * SIGN_MULT
-
-                # (your existing target_frac logic continues here...)
-                # target_frac = target_position_from_pred(...)
-
-                latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
-
-                # Feature snapshot from the same df row used for inference
-                feat_row = None
-                if df_feat is not None and not df_feat.empty:
-                    feat_row = df_feat.iloc[-1]
-
-                features_json = {k: None for k in DW_REQUIRED_FEATURE_KEYS}
-                features_json["pred_pct"] = _to_float_or_none(pred)
-                features_json["p_up"] = _to_float_or_none(sig.get("p_up"))
-                features_json["sigma20_pct"] = _to_float_or_none(sig.get("vol_est"))
-                features_json["px"] = _to_float_or_none(px)
-                features_json["target_frac"] = _to_float_or_none(target_frac)
-
-                # fill raw feature cols if available
-                if feat_row is not None:
-                    for k in features_json.keys():
-                        if k in ("pred_pct", "p_up", "sigma20_pct", "px", "target_frac"):
-                            continue
-                
-                        # Map model's lag1 feature into DriftWatch's canonical "price_change_pct"
-                        if k == "price_change_pct":
-                            if "price_change_pct_lag1" in feat_row.index:
-                                features_json["price_change_pct"] = _to_float_or_none(feat_row["price_change_pct_lag1"])
-                            continue
-                
-                        if k in feat_row.index:
-                            features_json[k] = _to_float_or_none(feat_row[k])
-
-                block_id_utc = block_start.astimezone(timezone.utc).replace(microsecond=0) \
-                    .isoformat().replace("+00:00", "Z")
-
-                request_id = f"{block_id_utc}|{sym}"
-
-                segment_json = {
-                    "sym": sym,
-                    "timeframe": DW_TIMEFRAME,
-                    "env": env,
-                    "session": "regular",
-                    "block_id": block_id_utc,
-                    "block_minutes": BLOCK_MINUTES,
-                }
-
-
-                dw.log_inference(
-                    model_id="trading_ensemble_ret_1h",
-                    model_version="mock-v1",
-                    ts=datetime.now(timezone.utc),
-                    pred_type="regression",
-                    y_pred_num=_to_float_or_none(pred),
-                    y_pred_text=None,
-                    latency_ms=latency_ms,
-                    features_json=features_json,
-                    segment_json=segment_json,
-                    request_id=request_id,   # ✅ not None
-                )
-
-                px_print = px if (px and np.isfinite(px)) else float("nan")
-                print(f"[PLAN] {sym}: px={px_print:.2f} pred_1h={pred:.3f}% p_up={sig['p_up']:.3f} vol_est={sig['vol_est']:.4f} target_pos={target_frac:+.3f}")
-
-                before_n = ledger.fills_count(sym)
-                submit_target(api, sym, target_frac, eq, px, ledger=ledger)
-                after_n = ledger.fills_count(sym)
-
-                submitted = after_n > before_n
-
-
-                # store request_id only for a real new entry
-                if submitted and is_new_entry:
-                    state["open_req_id"][sym] = request_id
-
-
-                absf = abs(target_frac)
-                if dec.hold_min_blocks is not None:
-                    hold_blocks = int(max(1, dec.hold_min_blocks))
-                else:
-                    if absf < 0.25:   hold_blocks = 1
-                    elif absf < 0.50: hold_blocks = 2
-                    else:             hold_blocks = 3
-                state.setdefault("hold_timer", {})[sym] = hold_blocks
-
-            except Exception as e:
-                print(f"[ERR] {sym}: {e}")
-                traceback.print_exc(limit=1)
-
-        save_state(state)
-
-        last_hb = 0
-        while now_ny() < block_end:
-            time.sleep(10)
-            if time.time() - last_hb >= 60:
-                print(f"[HB] {now_ny().strftime('%H:%M:%S %Z')} → {block_end.strftime('%H:%M:%S %Z')}", flush=True)
-                last_hb = time.time()
-
-        print("[EXIT] flattening block positions...", flush=True)
-
-        closed_pnl = {}  # symbol -> pnl_pct for rewards
-        for sym in SYMBOLS:
-            rem = int(state.get("hold_timer", {}).get(sym, 0))
-            if rem <= 1:
-                print(f"[FLATTEN] {sym}: closing position (timer expired)")
-
-                # close + record exit fill into persistent ledger
-                flatten(api, sym, ledger=ledger)
-                state["hold_timer"][sym] = 0
-
-                # compute realized pnl% for this symbol (entry+exit across blocks)
-                pnl_pct = ledger.compute_symbol_pnl_pct(sym)
-                ledger.clear_symbol(sym)
-
-                if pnl_pct is not None:
-                    closed_pnl[sym] = float(pnl_pct)
-
-                # DriftWatch label: join via request_id saved at entry time
-                req_id = state.get("open_req_id", {}).pop(sym, None)
-                if req_id is not None and pnl_pct is not None:
-                    dw.log_label(
-                        ts=datetime.now(timezone.utc),
-                        request_id=req_id,
-                        y_true_num=float(pnl_pct),
-                        label_type="regression",
-                        extra_json={"label_name": "realized_pnl_pct"}
-                    )
-
-            else:
-                state["hold_timer"][sym] = rem - 1
-                print(f"[HOLD] {sym}: keeping open for {state['hold_timer'][sym]} more block(s)")
-
-        # update RL rewards only for symbols that actually closed
-        if closed_pnl:
-            agent.update_rewards(closed_pnl)
-
-        state["agent"] = agent.export_state()
-        save_state(state)
-
-        # DriftWatch: end-of-block flush
-        dw.flush()
-
-        block_start = block_end
 
 
 
