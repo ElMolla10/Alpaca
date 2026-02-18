@@ -529,6 +529,10 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
 
     # --- Indicators ---
     df["price_change_pct"] = df["close"].pct_change() * 100.0
+    df["price_change_pct_lag1"] = df["price_change_pct"].shift(1)
+    df["price_change_pct_lag2"] = df["price_change_pct"].shift(2)
+    df["price_change_pct_lag3"] = df["price_change_pct"].shift(3)
+
     macd_ind = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
     df["MACDh_12_26_9"] = macd_ind.macd_diff()
     bb = BollingerBands(close=df["close"], window=20, window_dev=2.0)
@@ -539,13 +543,13 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
     df["sigma20_pct"] = df["sigma20_pct"].replace(0.0, np.nan)
 
     base = ["open","high","low","close","volume","vwap",
-            "price_change_pct","MACDh_12_26_9","BBM_20_2.0"]
+        "MACDh_12_26_9","BBM_20_2.0"]
     for f in base:
         if f not in df.columns:
             df[f] = 0.0
         df[f] = df[f].shift(1)
 
-    for f in ["price_change_pct","MACDh_12_26_9","BBM_20_2.0"]:
+    for f in ["MACDh_12_26_9","BBM_20_2.0"]:
         df[f+"_lag2"] = df[f].shift(2)
         df[f+"_lag3"] = df[f].shift(3)
 
