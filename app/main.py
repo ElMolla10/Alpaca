@@ -202,15 +202,28 @@ def save_state(st):
     except Exception:
         pass
 
-def ensure_market_open_or_wait(api):
+def ensure_market_open_or_wait(api) -> bool:
+    """
+    Returns True if market is open, False if closed/unknown.
+    Never raises: if /clock is blocked (401 etc), we continue (treat as unknown).
+    """
     try:
         clock = api.get_clock()
-        if getattr(clock, "is_open", False):
+        is_open = bool(getattr(clock, "is_open", False))
+        if is_open:
             print("[INFO] Market is open. Starting trading immediately.")
         else:
             print("[WAIT] Market closed. main() will handle wait.")
+        return is_open
     except Exception as e:
-        print(f"[WARN] ensure_market_open_or_wait: {e}")
+        # /v2/clock can 401 for some key types / endpoints; don't crash the bot.
+        msg = str(e)
+        if "401" in msg or "Unauthorized" in msg:
+            print("[WARN] /clock unauthorized (401). Continuing without clock; run_session will proceed.")
+        else:
+            print(f"[WARN] ensure_market_open_or_wait: {e}")
+        return False
+
 
 # =================== ALPACA HELPERS ===================
 def latest_price(api, sym):
