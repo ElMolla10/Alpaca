@@ -24,7 +24,16 @@ from dotenv import load_dotenv
 
 
 # Load .env variables early
-load_dotenv()
+# Load .env variables early (explicit path, works in all launch modes)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]   # .../Alpaca
+DOTENV_PATH = REPO_ROOT / ".env"
+load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+
+def _must_env(name: str) -> str:
+    v = os.getenv(name, "")
+    if not v.strip():
+        raise SystemExit(f"[FATAL] Missing/empty env var: {name} (loaded from {DOTENV_PATH})")
+    return v.strip()
 
 # === Agentic RL layer ===
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
@@ -67,9 +76,9 @@ def _to_float_or_none(x):
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
 TZ_NY = pytz.timezone("America/New_York")
 
-BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-KEY_ID   = os.environ.get("APCA_API_KEY_ID")          # <-- was os.environ[...]
-SECRET   = os.environ.get("APCA_API_SECRET_KEY")      # <-- was os.environ[...]
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").strip()
+KEY_ID   = _must_env("APCA_API_KEY_ID")
+SECRET   = _must_env("APCA_API_SECRET_KEY")
 
 
 # Market session
