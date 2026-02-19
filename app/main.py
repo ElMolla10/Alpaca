@@ -25,9 +25,16 @@ from dotenv import load_dotenv
 
 # Load .env variables early
 # Load .env variables early (explicit path, works in all launch modes)
+# Load .env variables early (explicit path; override-able via DOTENV_PATH env var)
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]   # .../Alpaca
-DOTENV_PATH = REPO_ROOT / ".env"
-load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+DOTENV_PATH = pathlib.Path(os.environ.get("DOTENV_PATH", str(REPO_ROOT / ".env"))).expanduser()
+
+if DOTENV_PATH.exists():
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+else:
+    # fallback: python-dotenv default search (CWD upwards)
+    load_dotenv(override=True)
+
 
 def _must_env(name: str) -> str:
     v = os.getenv(name, "")
@@ -202,27 +209,140 @@ def save_state(st):
     except Exception:
         pass
 
+def get_market_session(api, now_et: dt.datetime | None = None) -> dict:
+    """
+    Session timing without /v2/clock.
+    Primary: Alpaca calendar (/v2/calendar via api.get_calendar()).
+    Fallback: Mon–Fri 09:30–16:00 ET (ignores holidays/early closes).
+    """
+    now_et = now_et or now_ny()
+    today = now_et.date()
+    end_day = today + timedelta(days=10)
+
+    def _parse_date(x):
+        if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
+            return x
+        return dt.datetime.strptime(str(x).strip(), "%Y-%m-%d").date()
+
+    def _parse_hhmm(x):
+        s = str(x).strip()
+        for fmt in ("%H:%M", "%H:%M:%S"):
+            try:
+                return dt.datetime.strptime(s, fmt).time()
+            except Exception:
+                pass
+        return None
+
+    def _mk_et(date_: dt.date, t_: dt.time) -> dt.datetime:
+        return TZ_NY.localize(dt.datetime.combine(date_, t_))
+
+    def _next_weekday(d: dt.date) -> dt.date:
+        while d.weekday() >= 5:
+            d = d + timedelta(days=1)
+        return d
+
+    def _weekday_fallback(next_from: dt.date, source: str) -> dict:
+        d = _next_weekday(next_from)
+        market_open  = _mk_et(d, dt.time(9, 30))
+        market_close = _mk_et(d, dt.time(16, 0))
+        session_open  = _mk_et(d, dt.time(SESSION_START_H, 0))
+        session_close = market_close
+
+        is_open = (d == today) and (session_open <= now_et < session_close)
+
+        if is_open:
+            next_open = None
+        else:
+            if d == today and now_et < session_open:
+                next_open = session_open
+            elif d == today and now_et >= session_close:
+                nd = _next_weekday(today + timedelta(days=1))
+                next_open = _mk_et(nd, dt.time(SESSION_START_H, 0))
+            else:
+                next_open = session_open
+
+        return {
+            "source": source,
+            "market_day": d,
+            "market_open": market_open,
+            "market_close": market_close,
+            "session_open": session_open,
+            "session_close": session_close,
+            "next_open": next_open,
+            "is_open": is_open,
+        }
+
+    # Alpaca calendar
+    try:
+        cal_days = api.get_calendar(start=today.isoformat(), end=end_day.isoformat())
+        source = "alpaca_calendar"
+    except Exception as e:
+        return _weekday_fallback(today, f"fallback_weekday:{e.__class__.__name__}")
+
+    if not cal_days:
+        return _weekday_fallback(today, "fallback_weekday:empty_calendar")
+
+    norm = []
+    for day in cal_days:
+        try:
+            d = _parse_date(getattr(day, "date", None))
+            if today <= d <= end_day:
+                norm.append((d, day))
+        except Exception:
+            continue
+    norm.sort(key=lambda x: x[0])
+
+    if not norm:
+        return _weekday_fallback(today, "fallback_weekday:no_days_in_range")
+
+    chosen = None
+    for d, day in norm:
+        open_t = _parse_hhmm(getattr(day, "open", None))
+        close_t = _parse_hhmm(getattr(day, "close", None))
+        if open_t is None or close_t is None:
+            continue
+
+        market_open  = _mk_et(d, open_t)
+        market_close = _mk_et(d, close_t)  # early close supported
+        session_open  = max(market_open, _mk_et(d, dt.time(SESSION_START_H, 0)))
+        session_close = market_close
+
+        if d == today and now_et >= session_close:
+            continue
+
+        chosen = (d, market_open, market_close, session_open, session_close)
+        break
+
+    if chosen is None:
+        return _weekday_fallback(today + timedelta(days=1), "fallback_weekday:post_close")
+
+    d, market_open, market_close, session_open, session_close = chosen
+    is_open = (d == today) and (session_open <= now_et < session_close)
+    next_open = None if is_open else session_open
+
+    return {
+        "source": source,
+        "market_day": d,
+        "market_open": market_open,
+        "market_close": market_close,
+        "session_open": session_open,
+        "session_close": session_close,
+        "next_open": next_open,
+        "is_open": is_open,
+    }
+
+
 def ensure_market_open_or_wait(api) -> bool:
     """
-    Returns True if market is open, False if closed/unknown.
-    Never raises: if /clock is blocked (401 etc), we continue (treat as unknown).
+    Returns True if market is open, False if closed.
+    Uses calendar (no /clock).
     """
-    try:
-        clock = api.get_clock()
-        is_open = bool(getattr(clock, "is_open", False))
-        if is_open:
-            print("[INFO] Market is open. Starting trading immediately.")
-        else:
-            print("[WAIT] Market closed. main() will handle wait.")
-        return is_open
-    except Exception as e:
-        # /v2/clock can 401 for some key types / endpoints; don't crash the bot.
-        msg = str(e)
-        if "401" in msg or "Unauthorized" in msg:
-            print("[WARN] /clock unauthorized (401). Continuing without clock; run_session will proceed.")
-        else:
-            print(f"[WARN] ensure_market_open_or_wait: {e}")
-        return False
+    info = get_market_session(api, now_ny())
+    if info["is_open"]:
+        print("[INFO] Market is open (calendar).")
+        return True
+    print(f"[WAIT] Market closed (calendar). next_open={info.get('next_open')}")
+    return False
 
 
 # =================== ALPACA HELPERS ===================
@@ -765,9 +885,14 @@ def run_session(api):
         ledger = BlockLedger(TRADE_COST_BPS, SLIP_BPS)
 
         t_now = now_ny()
-        session_open  = t_now.replace(hour=SESSION_START_H, minute=0, second=0, microsecond=0)
-        session_close = t_now.replace(hour=16, minute=0, second=0, microsecond=0)
+        sess = get_market_session(api, t_now)
+        session_open  = sess["session_open"]
+        session_close = sess["session_close"]
+        print(f"[SESSION] source={sess['source']} day={sess['market_day']} "
+              f"market={sess['market_open'].strftime('%H:%M')}–{sess['market_close'].strftime('%H:%M')} ET "
+              f"session={session_open.strftime('%H:%M')}–{session_close.strftime('%H:%M')} ET open={sess['is_open']}")
         block_start   = t_now if t_now >= session_open else session_open
+
 
         b = 0
         while True:
@@ -1057,29 +1182,41 @@ if __name__ == "__main__":
 
     try:
         api = REST(KEY_ID, SECRET, BASE_URL, api_version="v2")
-        clock = api.get_clock()
-        print(f"[CLOCK] open={clock.is_open} next_open={clock.next_open} next_close={clock.next_close}")
 
-        if getattr(clock, "is_open", False):
+        # No /v2/clock: use calendar-derived session info
+        sess = get_market_session(api, now_ny())
+        print(
+            f"[SESSION] source={sess['source']} day={sess['market_day']} "
+            f"market={sess['market_open'].strftime('%H:%M')}–{sess['market_close'].strftime('%H:%M')} ET "
+            f"session={sess['session_open'].strftime('%H:%M')}–{sess['session_close'].strftime('%H:%M')} ET "
+            f"open={sess['is_open']}"
+        )
+
+        if sess["is_open"]:
             print("[INFO] Market is open. Starting trading immediately.")
             run_session(api)
             sys.exit(0)
-        else:
-            now_utc = dt.datetime.now(dt.timezone.utc)
-            open_utc = clock.next_open.astimezone(dt.timezone.utc)
-            wait_sec = max(0, (open_utc - now_utc).total_seconds())
-            hrs = wait_sec / 3600.0
-            print(f"[WAIT] Market closed. Waiting {hrs:.2f} hours until next open ({open_utc.isoformat()}).")
-            remaining = wait_sec
-            while remaining > 0:
-                chunk = min(300, remaining)
-                time.sleep(chunk)
-                remaining -= chunk
-                left_hrs = remaining / 3600.0
-                print(f"[WAIT] ... {left_hrs:.2f} hours remaining until market open.")
-            print("[INFO] Market is now open. Starting session.")
-            run_session(api)
-            sys.exit(0)
+
+        next_open = sess.get("next_open")
+        if next_open is None:
+            print("[WAIT] Market closed but next_open unavailable; exiting.")
+            sys.exit(1)
+
+        wait_sec = max(0.0, (next_open - now_ny()).total_seconds())
+        hrs = wait_sec / 3600.0
+        print(f"[WAIT] Market closed. Waiting {hrs:.2f} hours until next session open ({next_open.isoformat()}).")
+
+        remaining = wait_sec
+        while remaining > 0:
+            chunk = min(300.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+            left_hrs = remaining / 3600.0
+            print(f"[WAIT] ... {left_hrs:.2f} hours remaining until session open.")
+
+        print("[INFO] Session open reached. Starting session.")
+        run_session(api)
+        sys.exit(0)
 
     except KeyError as e:
         print(f"[FATAL] missing env var: {e}")
