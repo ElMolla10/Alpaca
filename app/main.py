@@ -68,8 +68,9 @@ ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 
 TZ_NY = pytz.timezone("America/New_York")
 
 BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-KEY_ID   = os.environ["APCA_API_KEY_ID"]
-SECRET   = os.environ["APCA_API_SECRET_KEY"]
+KEY_ID   = os.environ.get("APCA_API_KEY_ID")          # <-- was os.environ[...]
+SECRET   = os.environ.get("APCA_API_SECRET_KEY")      # <-- was os.environ[...]
+
 
 # Market session
 SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET
@@ -1028,6 +1029,10 @@ def run_session(api):
 # =================== ENTRY ===================
 if __name__ == "__main__":
     print("=== START ===", utc_ts())
+    if not KEY_ID or not SECRET:
+        print("[FATAL] Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY (set env or .env).")
+        sys.exit(2)
+
     try:
         api = REST(KEY_ID, SECRET, BASE_URL, api_version="v2")
         clock = api.get_clock()
