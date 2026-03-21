@@ -2,6 +2,8 @@
 # app/main.py
 
 import os, sys, time, math, json, traceback
+import psycopg2
+from psycopg2.extras import execute_values
 import datetime as dt
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -544,6 +546,91 @@ def submit_target(api, sym, target_pos_frac, equity, last_px, ledger: BlockLedge
 with open(FEATS_PATH, "r") as f:
     FEAT_COLS = json.load(f)
 print(f"[INIT] loaded {len(FEAT_COLS)} feat cols")
+
+# ── Market-data persistence helpers ──────────────────────────────────────────
+
+def _get_db_conn():
+    dsn = os.getenv("DRIFTWATCH_DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DRIFTWATCH_DATABASE_URL is not set.")
+    return psycopg2.connect(dsn)
+
+
+def _persist_bars(symbol: str, df: pd.DataFrame) -> None:
+    """Bulk-insert raw OHLCV bars into market_data. Idempotent, never raises."""
+    if df.empty:
+        return
+    try:
+        rows = []
+        for row in df.itertuples(index=False):
+            ts = row.timestamp
+            if isinstance(ts, pd.Timestamp):
+                ts = ts.to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            vwap_val = float(row.vwap) if hasattr(row, "vwap") and not math.isnan(row.vwap) else None
+            rows.append((
+                symbol, ts, "1h",
+                float(row.open)   if not math.isnan(row.open)   else None,
+                float(row.high)   if not math.isnan(row.high)   else None,
+                float(row.low)    if not math.isnan(row.low)    else None,
+                float(row.close)  if not math.isnan(row.close)  else None,
+                float(row.volume) if not math.isnan(row.volume) else None,
+                vwap_val,
+            ))
+        sql = """
+            INSERT INTO market_data (symbol, ts, timeframe, open, high, low, close, volume, vwap)
+            VALUES %s
+            ON CONFLICT (symbol, ts, timeframe) DO NOTHING
+        """
+        with _get_db_conn() as conn:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, rows)
+        print(f"[PERSIST] {symbol}: {len(rows)} bars written to market_data")
+    except Exception as exc:
+        print(f"[WARN][PERSIST] {symbol}: market_data write failed (engine continues): {exc}")
+
+
+def _persist_feature_snapshot(symbol: str, ts: datetime, feat_dict: dict) -> None:
+    """Insert latest feature vector into feature_snapshots. Idempotent, never raises."""
+    try:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        sql = """
+            INSERT INTO feature_snapshots (symbol, ts, features)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (symbol, ts) DO NOTHING
+        """
+        with _get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (symbol, ts, json.dumps(feat_dict)))
+        print(f"[PERSIST] {symbol}: feature snapshot saved at {ts}")
+    except Exception as exc:
+        print(f"[WARN][PERSIST] {symbol}: feature_snapshots write failed (engine continues): {exc}")
+
+
+def _load_bars_from_db(symbol: str, lookback_days: int = 30) -> pd.DataFrame:
+    """Load cached bars from market_data. Returns empty DataFrame on any failure."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        sql = """
+            SELECT ts, open, high, low, close, volume, vwap
+            FROM   market_data
+            WHERE  symbol    = %s
+              AND  timeframe = '1h'
+              AND  ts        >= %s
+            ORDER  BY ts ASC
+        """
+        with _get_db_conn() as conn:
+            db_df = pd.read_sql(sql, conn, params=(symbol, since))
+        if not db_df.empty:
+            db_df = db_df.rename(columns={"ts": "timestamp"})
+            if db_df["timestamp"].dt.tz is None:
+                db_df["timestamp"] = db_df["timestamp"].dt.tz_localize("UTC")
+        return db_df
+    except Exception as exc:
+        print(f"[DEBUG][PERSIST] {symbol}: could not load DB cache: {exc}")
+        return pd.DataFrame()
 print(f"[PARITY] FEAT_COLS={len(FEAT_COLS)} window=10:00–15:59 ET, model_horizon={PRIMARY_H}h, block_minutes={BLOCK_MINUTES}")
 
 def _ts_to_utc(ts_any) -> pd.Timestamp:
@@ -561,6 +648,12 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
 
     Features are aligned to the 1h-trained models; trading loop may run at 30-minute blocks.
     """
+
+    # ── DB-cache optimisation: only fetch last 3 days if we already have history ──
+    db_df = _load_bars_from_db(sym, lookback_days=lookback_days)
+    if len(db_df) >= 100:
+        lookback_days = 3
+        print(f"[PERSIST] {sym}: DB cache hit ({len(db_df)} rows) – fetching only last 3 days from Alpaca")
 
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=lookback_days)
@@ -605,6 +698,15 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
             "vwap": float(getattr(b, "vw", np.nan)) if hasattr(b, "vw") else np.nan,
         })
     df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+    # ── Persist raw bars BEFORE feature computation ───────────────────────────
+    _persist_bars(sym, df)
+
+    # ── Merge DB cache with fresh Alpaca bars ─────────────────────────────────
+    if not db_df.empty and not df.empty:
+        db_df_trimmed = db_df[db_df["timestamp"] < df["timestamp"].min()]
+        if not db_df_trimmed.empty:
+            df = pd.concat([db_df_trimmed, df], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
 
     # --- synthesize partial 10:00→now bar (only 10:00–<11:00 ET) ---
     try:
@@ -732,6 +834,20 @@ def fetch_recent_features(api: REST, sym: str, lookback_days: int = 30) -> pd.Da
             cols.append(c)
 
     df = df[cols]
+
+    # ── Persist the latest feature snapshot ───────────────────────────────────
+    if not df.empty:
+        last = df.iloc[-1]
+        last_ts = last["timestamp"]
+        if isinstance(last_ts, pd.Timestamp):
+            last_ts = last_ts.to_pydatetime()
+        feat_dict = {
+            col: (None if (col not in df.columns or (isinstance(last[col], float) and math.isnan(last[col]))) else float(last[col]))
+            for col in FEAT_COLS
+            if col in df.columns
+        }
+        _persist_feature_snapshot(sym, last_ts, feat_dict)
+
     return df
 
 
