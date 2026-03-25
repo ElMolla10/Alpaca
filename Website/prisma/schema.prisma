@@ -2,8 +2,7 @@
 // Learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider = "postgresql"
 }
 
 generator client {
@@ -56,4 +55,38 @@ model User {
 
   accounts Account[]
   sessions Session[]
+}
+
+model market_data {
+  id     Int      @id @default(autoincrement())
+  symbol String
+  ts     DateTime
+  open   Float
+  high   Float
+  low    Float
+  close  Float
+  volume Float
+  vwap   Float?
+
+  @@index([symbol, ts])
+}
+
+model feature_snapshots {
+  id     Int      @id @default(autoincrement())
+  symbol String
+  ts     DateTime
+
+  @@index([symbol, ts])
+}
+
+model inference_events {
+  id           Int      @id @default(autoincrement())
+  ts           DateTime
+  model_id     String
+  request_id   String   @unique
+  y_pred_num   Float?
+  latency_ms   Float?
+  segment_json Json?
+
+  @@index([ts])
 }
