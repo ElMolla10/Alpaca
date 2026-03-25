@@ -27,7 +27,8 @@ export function EquityChart() {
                 border: `1px solid var(--color-border)`,
                 borderRadius: "8px",
               }}
-              formatter={(value: number) => `$${value.toLocaleString()}`}
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              formatter={(value: any) => `$${Number(value ?? 0).toLocaleString()}`}
             />
             <Line
               type="monotone"

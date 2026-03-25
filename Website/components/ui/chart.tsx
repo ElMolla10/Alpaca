@@ -118,8 +118,9 @@ function ChartTooltipContent({
   color,
   nameKey,
   labelKey,
-}: React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
-  React.ComponentProps<'div'> & {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+}: Record<string, any> & {
+    className?: string
     hideLabel?: boolean
     hideIndicator?: boolean
     indicator?: 'line' | 'dot' | 'dashed'
@@ -179,7 +180,8 @@ function ChartTooltipContent({
     >
       {!nestLabel ? tooltipLabel : null}
       <div className="grid gap-1.5">
-        {payload.map((item, index) => {
+        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+        {payload.map((item: any, index: number) => {
           const key = `${nameKey || item.name || item.dataKey || 'value'}`
           const itemConfig = getPayloadConfigFromPayload(config, item, key)
           const indicatorColor = color || item.payload.fill || item.color
@@ -256,8 +258,9 @@ function ChartLegendContent({
   payload,
   verticalAlign = 'bottom',
   nameKey,
-}: React.ComponentProps<'div'> &
-  Pick<RechartsPrimitive.LegendProps, 'payload' | 'verticalAlign'> & {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+}: Record<string, any> & {
+    className?: string
     hideIcon?: boolean
     nameKey?: string
   }) {
@@ -275,7 +278,8 @@ function ChartLegendContent({
         className,
       )}
     >
-      {payload.map((item) => {
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      {payload.map((item: any) => {
         const key = `${nameKey || item.dataKey || 'value'}`
         const itemConfig = getPayloadConfigFromPayload(config, item, key)
 

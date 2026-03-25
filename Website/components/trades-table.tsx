@@ -17,9 +17,8 @@ export function TradesTable() {
                 <th className="text-left py-2 px-2 font-medium text-muted-foreground">Symbol</th>
                 <th className="text-left py-2 px-2 font-medium text-muted-foreground">Side</th>
                 <th className="text-right py-2 px-2 font-medium text-muted-foreground">Qty</th>
-                <th className="text-right py-2 px-2 font-medium text-muted-foreground">Entry Price</th>
-                <th className="text-right py-2 px-2 font-medium text-muted-foreground">Exit Price</th>
-                <th className="text-right py-2 px-2 font-medium text-muted-foreground">Realized P&L</th>
+                <th className="text-right py-2 px-2 font-medium text-muted-foreground">Fill Price</th>
+                <th className="text-right py-2 px-2 font-medium text-muted-foreground">P&L</th>
                 <th className="text-right py-2 px-2 font-medium text-muted-foreground">Return %</th>
                 <th className="text-left py-2 px-2 font-medium text-muted-foreground">Date</th>
               </tr>
@@ -31,7 +30,7 @@ export function TradesTable() {
                   <td className="py-2 px-2">
                     <span
                       className={`px-2 py-1 rounded text-xs font-medium ${
-                        trade.side === "BUY"
+                        trade.side === "buy"
                           ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-200"
                           : "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-200"
                       }`}
@@ -39,18 +38,19 @@ export function TradesTable() {
                       {trade.side}
                     </span>
                   </td>
-                  <td className="text-right py-2 px-2">{trade.quantity}</td>
-                  <td className="text-right py-2 px-2">${trade.entryPrice.toFixed(2)}</td>
-                  <td className="text-right py-2 px-2">${trade.exitPrice.toFixed(2)}</td>
-                  <td className={`text-right py-2 px-2 ${trade.realizedPL >= 0 ? "text-green-600" : "text-red-600"}`}>
-                    ${trade.realizedPL.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  <td className="text-right py-2 px-2">{trade.qty}</td>
+                  <td className="text-right py-2 px-2">${trade.fill_price.toFixed(2)}</td>
+                  <td className={`text-right py-2 px-2 ${trade.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
+                    ${trade.pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                   </td>
                   <td
-                    className={`text-right py-2 px-2 ${trade.realizedPLPercent >= 0 ? "text-green-600" : "text-red-600"}`}
+                    className={`text-right py-2 px-2 ${trade.pnl_pct >= 0 ? "text-green-600" : "text-red-600"}`}
                   >
-                    {trade.realizedPLPercent.toFixed(2)}%
+                    {trade.pnl_pct.toFixed(2)}%
                   </td>
-                  <td className="py-2 px-2 text-muted-foreground text-xs">{trade.date}</td>
+                  <td className="py-2 px-2 text-muted-foreground text-xs">
+                    {new Date(trade.filled_at).toLocaleDateString()}
+                  </td>
                 </tr>
               ))}
             </tbody>

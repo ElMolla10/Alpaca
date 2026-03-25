@@ -38,7 +38,7 @@ export async function POST(request: Request) {
     })
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return Response.json({ error: "Invalid input", details: error.errors }, { status: 400 })
+      return Response.json({ error: "Invalid input", details: error.issues }, { status: 400 })
     }
     return Response.json({ error: "Internal server error" }, { status: 500 })
   }
