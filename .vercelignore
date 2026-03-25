@@ -1,0 +1,13 @@
+polygon_hourly_30d_multi
+polygon_hourly_5y_multi
+XGboost_model
+venv
+__pycache__
+*.py
+*.ipynb
+Data Download.ipynb
+requirements.txt
+runtime.txt
+render.yaml
+schema
+app
