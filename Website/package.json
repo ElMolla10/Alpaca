@@ -1,0 +1,44 @@
+{
+  "name": "agentic-trading",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=18.17.0 <22"
+  },
+  "scripts": {
+    "build": "prisma generate && next build",
+    "dev": "next dev",
+    "lint": "eslint .",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@alpacahq/alpaca-trade-api": "latest",
+    "@auth/core": "latest",
+    "@auth/prisma-adapter": "latest",
+    "@prisma/adapter-pg": "latest",
+    "@prisma/client": "latest",
+    "@vercel/analytics": "latest",
+    "bcryptjs": "latest",
+    "lucide-react": "latest",
+    "next": "14.2.25",
+    "next-auth": "latest",
+    "pg": "latest",
+    "prisma": "latest",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-is": "latest",
+    "recharts": "latest"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "latest",
+    "@types/node": "latest",
+    "@types/pg": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "14.2.25",
+    "postcss": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest"
+  }
+}

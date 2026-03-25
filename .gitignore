@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.pyc
+
+# Env files
+.env
+.env.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Data files
+polygon_hourly_30d_multi/
+polygon_hourly_5y_multi/
+
+# IDE
+.vscode/
+
+# Website build artifacts — handled by website/.gitignore
