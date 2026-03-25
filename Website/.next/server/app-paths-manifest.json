@@ -1,0 +1,18 @@
+{
+  "/_not-found/page": "app/_not-found/page.js",
+  "/api/dashboard/equity-history/route": "app/api/dashboard/equity-history/route.js",
+  "/api/dashboard/positions/route": "app/api/dashboard/positions/route.js",
+  "/api/dashboard/check-database/route": "app/api/dashboard/check-database/route.js",
+  "/api/market-data/route": "app/api/market-data/route.js",
+  "/api/inferences/route": "app/api/inferences/route.js",
+  "/api/auth/signup/route": "app/api/auth/signup/route.js",
+  "/api/dashboard/trades/route": "app/api/dashboard/trades/route.js",
+  "/api/equity-history/route": "app/api/equity-history/route.js",
+  "/api/dashboard/summary/route": "app/api/dashboard/summary/route.js",
+  "/login/page": "app/login/page.js",
+  "/signup/page": "app/signup/page.js",
+  "/api/features/route": "app/api/features/route.js",
+  "/page": "app/page.js",
+  "/dashboard/page": "app/dashboard/page.js",
+  "/api/auth/[...nextauth]/route": "app/api/auth/[...nextauth]/route.js"
+}
