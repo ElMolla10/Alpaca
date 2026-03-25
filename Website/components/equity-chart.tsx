@@ -1,14 +1,26 @@
 "use client"
 
+import { useState, useEffect } from "react"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { mockEquityHistory } from "@/lib/mock-data"
-
 export function EquityChart() {
-  const chartData = mockEquityHistory.map((item) => ({
-    date: item.date,
-    equity: Math.round(item.equity),
-  }))
+  const [chartData, setChartData] = useState<{ date: string; equity: number }[]>([])
+
+  useEffect(() => {
+    fetch("/api/dashboard/equity-history?period=1M&timeframe=1D")
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data.timestamps) && data.timestamps.length > 0) {
+          setChartData(
+            data.timestamps.map((date: string, i: number) => ({
+              date,
+              equity: Math.round(data.equity[i] ?? 0),
+            }))
+          )
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   return (
     <Card className="col-span-full bg-card border-border">

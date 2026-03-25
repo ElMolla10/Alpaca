@@ -1,5 +1,3 @@
-import { getMockAccount, getMockPositions, getMockEquityHistory, getMockTrades } from "@/lib/mock-data"
-
 export interface TradeAccount {
   equity: number
   cash: number
@@ -45,8 +43,10 @@ if (hasCredentials) {
   }
 }
 
+const emptyAccount: TradeAccount = { equity: 0, cash: 0, buying_power: 0, portfolio_value: 0 }
+
 export async function getAccount(): Promise<TradeAccount> {
-  if (!alpaca) return getMockAccount()
+  if (!alpaca) return emptyAccount
   try {
     const account = await alpaca.getAccount()
     return {
@@ -56,12 +56,12 @@ export async function getAccount(): Promise<TradeAccount> {
       portfolio_value: parseFloat(account.portfolio_value),
     }
   } catch {
-    return getMockAccount()
+    return emptyAccount
   }
 }
 
 export async function getPositions(): Promise<Position[]> {
-  if (!alpaca) return getMockPositions()
+  if (!alpaca) return []
   try {
     const positions = await alpaca.getPositions()
     return positions.map((p: any) => ({
@@ -73,7 +73,7 @@ export async function getPositions(): Promise<Position[]> {
       unrealized_plpc: parseFloat(p.unrealized_plpc),
     }))
   } catch {
-    return getMockPositions()
+    return []
   }
 }
 
@@ -81,7 +81,7 @@ export async function getPortfolioHistory(
   period: string = "1M",
   timeframe: string = "1D"
 ): Promise<{ timestamp: string; equity: number; profit_loss: number; profit_loss_pct: number }[]> {
-  if (!alpaca) return getMockEquityHistory(period)
+  if (!alpaca) return []
   try {
     const history = await alpaca.getPortfolioHistory({ period, timeframe })
     const timestamps: number[] = history.timestamp || []
@@ -89,7 +89,6 @@ export async function getPortfolioHistory(
     const profitLoss: number[] = history.profit_loss || []
     const profitLossPct: number[] = history.profit_loss_pct || []
 
-    // Use first positive equity as base
     const baseEquity = equities.find((e) => e > 0) ?? equities[0] ?? 0
 
     return timestamps.map((ts, i) => ({
@@ -99,7 +98,7 @@ export async function getPortfolioHistory(
       profit_loss_pct: profitLossPct[i] ?? (baseEquity > 0 ? ((equities[i] - baseEquity) / baseEquity) * 100 : 0),
     }))
   } catch {
-    return getMockEquityHistory(period)
+    return []
   }
 }
 
@@ -107,7 +106,7 @@ export async function getOrders(
   status: string = "closed",
   limit: number = 50
 ): Promise<Trade[]> {
-  if (!alpaca) return getMockTrades()
+  if (!alpaca) return []
   try {
     const orders = await alpaca.getOrders({ status, limit })
     return orders.map((o: any) => ({
@@ -120,7 +119,7 @@ export async function getOrders(
       filled_at: o.filled_at,
     }))
   } catch {
-    return getMockTrades()
+    return []
   }
 }
 
