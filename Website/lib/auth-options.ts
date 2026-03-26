@@ -15,7 +15,7 @@ export const authOptions: NextAuthOptions = {
         if (!credentials?.email || !credentials?.password) {
           throw new Error("Email and password required")
         }
-        const user = await prisma.user.findUnique({ where: { email: credentials.email } })
+        const user = await prisma.user.findUnique({ where: { email: credentials.email.toLowerCase() } })
         if (!user) throw new Error("No user found with this email")
         const passwordMatch = await bcrypt.compare(credentials.password, user.passwordHash)
         if (!passwordMatch) throw new Error("Invalid password")

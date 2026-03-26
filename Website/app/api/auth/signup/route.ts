@@ -10,7 +10,8 @@ const signupSchema = z.object({
 export async function POST(request: Request) {
   try {
     const body = await request.json()
-    const { email, password } = signupSchema.parse(body)
+    const { email: rawEmail, password } = signupSchema.parse(body)
+    const email = rawEmail.toLowerCase()
 
     // Check if user already exists
     const existingUser = await prisma.user.findUnique({
