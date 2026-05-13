@@ -26,6 +26,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     load_dotenv = None
 
+from app.risk_preference import RISK_STYLE_LABELS, VALID_RISK_STYLES, read_risk_preference, write_risk_preference
+
 
 APP_TITLE = "Alpaca Project Command Center"
 DEFAULT_HOST = "127.0.0.1"
@@ -254,6 +256,23 @@ def repo_snapshot() -> Dict[str, Any]:
             "tests/",
         ],
     }
+
+
+def current_risk_preference() -> Dict[str, Any]:
+    style = read_risk_preference()
+    options = []
+    for item in PROJECT_SPEC["user_styles"]:
+        name = item["name"]
+        options.append(
+            {
+                "name": name,
+                "label": RISK_STYLE_LABELS.get(name, name.replace("_", " ").title()),
+                "selected": name == style,
+                **item,
+            }
+        )
+    active = next((item for item in options if item["selected"]), options[0])
+    return {"style": style, "label": active["label"], "options": options}
 
 
 def _sample_trading(reason: str) -> Dict[str, Any]:
@@ -539,6 +558,7 @@ def fetch_project() -> Dict[str, Any]:
     return {
         "project": PROJECT_SPEC,
         "repo": repo_snapshot(),
+        "preference": current_risk_preference(),
         "trading": fetch_trading_data(),
         "drift": fetch_results(),
     }
@@ -718,6 +738,37 @@ HTML = r"""<!doctype html>
       border-radius: 6px;
       color: #cfe5ff;
     }
+    .risk-control {
+      display: grid;
+      gap: 12px;
+    }
+    .risk-control label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .risk-control select, .risk-control button {
+      width: 100%;
+      border-radius: 6px;
+      border: 1px solid rgba(98,183,255,.22);
+      background: rgba(4,8,15,.85);
+      color: #dbeeff;
+      padding: 10px 12px;
+      font: inherit;
+    }
+    .risk-control button {
+      cursor: pointer;
+      background: linear-gradient(180deg, rgba(47,140,255,.22), rgba(47,140,255,.1));
+      font-weight: 700;
+    }
+    .risk-control button:hover { border-color: rgba(98,183,255,.4); }
+    .risk-summary {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
     .risk-row {
       display: grid;
       grid-template-columns: 38px 1fr 86px;
@@ -878,7 +929,17 @@ HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <section id="config" class="section grid two">
+    <section id="config" class="section grid three">
+      <div class="card">
+        <div class="section-head"><h2>Risk Preference</h2><span>adjustable from the command center</span></div>
+        <div class="body risk-control">
+          <label for="riskStyle">Active profile</label>
+          <select id="riskStyle"></select>
+          <button id="riskSave" type="button">Save Profile</button>
+          <div class="risk-summary" id="riskSummary"></div>
+          <div class="chips" id="riskPreview"></div>
+        </div>
+      </div>
       <div class="card">
         <div class="section-head"><h2>Feature Manifest</h2><span id="featureCount">0 features</span></div>
         <div class="body features" id="features"></div>
@@ -1001,7 +1062,7 @@ HTML = r"""<!doctype html>
     }
 
     function render(data) {
-      const project = data.project, repo = data.repo, drift = data.drift, trading = data.trading || {}, s = drift.summary || {};
+      const project = data.project, repo = data.repo, drift = data.drift, trading = data.trading || {}, preference = data.preference || {}, s = drift.summary || {};
       const account = trading.account || {};
       const liveTrading = trading.mode === "live";
       const liveDrift = drift.mode === "live";
@@ -1068,6 +1129,33 @@ HTML = r"""<!doctype html>
         ["Drift mode", drift.mode, drift.status],
         ["Last event", s.last_event_ts ? time(s.last_event_ts) : "-", "latest inference timestamp"],
       ].map(([a,b,c]) => `<div class="mini"><h3>${a}</h3><p class="value" style="font-size:20px">${b}</p><p>${c}</p></div>`).join("");
+
+      const riskOptions = preference.options || project.user_styles || [];
+      const riskSelect = document.getElementById("riskStyle");
+      riskSelect.innerHTML = riskOptions.map(item => `<option value="${item.name}">${item.label || item.name}</option>`).join("");
+      riskSelect.value = preference.style || (riskOptions[0] ? riskOptions[0].name : "");
+      document.getElementById("riskSummary").innerHTML = `
+        <div><strong>Active profile:</strong> ${preference.label || riskSelect.value || "-"}</div>
+        <div><strong>Trading engine:</strong> reads this selection each block</div>
+        <div><strong>Persistence:</strong> stored in <span class="mono">app/data/user_style.json</span></div>
+      `;
+      document.getElementById("riskPreview").innerHTML = riskOptions.map(item => `
+        <span class="mono ${item.selected ? "good" : ""}">${item.name}${item.selected ? " · active" : ""}</span>
+      `).join("");
+      document.getElementById("riskSave").onclick = async () => {
+        const style = riskSelect.value;
+        const res = await fetch("/api/preferences", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ style }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          document.getElementById("riskSummary").innerHTML = `<div class="warn">Could not save profile: ${payload.error || res.statusText}</div>`;
+          return;
+        }
+        load();
+      };
 
       document.getElementById("profileRows").innerHTML = project.user_styles.map(p => `
         <tr><td class="mono">${p.name}</td><td>${p.lookback}d</td><td>${p.max_symbols}</td><td>${p.band}</td><td>${p.ema}</td><td>${p.size}</td><td>${p.hold}</td><td>${p.epsilon}</td><td>${p.alpha}</td></tr>
@@ -1153,10 +1241,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if include_body:
             self.wfile.write(body)
 
+    def _read_json_body(self) -> Dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def _handle(self, include_body: bool = True) -> None:
         path = urlparse(self.path).path
         if path in PAGE_PATHS:
             self._write(HTTPStatus.OK, "text/html; charset=utf-8", HTML.encode("utf-8"), include_body)
+            return
+        if path == "/api/preferences":
+            if self.command == "GET":
+                body = json.dumps(current_risk_preference(), default=_json_default).encode("utf-8")
+                self._write(HTTPStatus.OK, "application/json; charset=utf-8", body, include_body)
+                return
+            if self.command == "POST":
+                payload = self._read_json_body()
+                style = str(payload.get("style", "")).strip()
+                if style not in VALID_RISK_STYLES:
+                    body = json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Invalid risk style.",
+                            "valid_styles": list(VALID_RISK_STYLES),
+                        }
+                    ).encode("utf-8")
+                    self._write(HTTPStatus.BAD_REQUEST, "application/json; charset=utf-8", body, include_body)
+                    return
+                if not write_risk_preference(style):
+                    body = json.dumps({"ok": False, "error": "Could not persist preference."}).encode("utf-8")
+                    self._write(HTTPStatus.INTERNAL_SERVER_ERROR, "application/json; charset=utf-8", body, include_body)
+                    return
+                body = json.dumps({"ok": True, **current_risk_preference()}, default=_json_default).encode("utf-8")
+                self._write(HTTPStatus.OK, "application/json; charset=utf-8", body, include_body)
+                return
+            body = json.dumps({"ok": False, "error": "Method not allowed."}).encode("utf-8")
+            self._write(HTTPStatus.METHOD_NOT_ALLOWED, "application/json; charset=utf-8", body, include_body)
             return
         if path == "/api/results":
             body = json.dumps(fetch_results(), default=_json_default).encode("utf-8")
@@ -1176,6 +1306,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._handle(include_body=False)
 
     def do_GET(self) -> None:
+        self._handle(include_body=True)
+
+    def do_POST(self) -> None:
         self._handle(include_body=True)
 
     def log_message(self, fmt: str, *args: Any) -> None:

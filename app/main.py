@@ -40,6 +40,7 @@ load_dotenv()
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
 from app.execution import BlockLedger
 from app.news_sentiment import fetch_news_scores
+from app.risk_preference import read_risk_preference
 
 # === DriftWatch ===
 from app.driftwatch_client import DriftWatchClient
@@ -73,6 +74,12 @@ def _to_float_or_none(x):
         return v
     except Exception:
         return None
+
+
+def current_agent_style() -> UserStyle:
+    style = default_style(read_risk_preference())
+    style.max_symbols = min(style.max_symbols, AGENT_MAX_SYMBOLS)
+    return style
 
 # =================== CONFIG / ENV ===================
 ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 'sip' if subscribed
@@ -125,7 +132,6 @@ THROTTLE_SIZE_MULT   = float(os.environ.get("THROTTLE_SIZE_MULT", "0.70"))  # sc
 
 # Agentic switches
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
-USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
 AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "20"))
 
 # News sentiment
@@ -873,8 +879,7 @@ def run_session(api):
             except Exception as e:
                 print(f"[LONGS_ONLY_ERR] pre-open cover: {e}")
 
-        agent_style = default_style(USER_STYLE)
-        agent_style.max_symbols = AGENT_MAX_SYMBOLS
+        agent_style = current_agent_style()
         agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
         print(f"[AGENT] style={agent_style.name} max_symbols={agent_style.max_symbols}")
 
@@ -888,6 +893,8 @@ def run_session(api):
         b = 0
         block_index = 0
         while True:
+            agent_style = current_agent_style()
+            agent = ARLAgent(agent_style, persisted=state.get("agent", {}))
             # 1) EOD check
             mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
             if mins_to_close_now <= EOD_FLATTEN_MIN_BEFORE_CLOSE:
