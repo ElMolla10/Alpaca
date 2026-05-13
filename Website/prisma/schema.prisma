@@ -2,7 +2,7 @@
 // Learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 datasource db {
-  provider = "mysql"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -56,4 +56,41 @@ model User {
 
   accounts Account[]
   sessions Session[]
+}
+
+model InferenceEvent {
+  id           BigInt   @id @default(autoincrement())
+  ts           DateTime
+  modelId      String   @map("model_id")
+  modelVersion String   @map("model_version")
+  requestId    String?  @unique @map("request_id")
+  predType     String   @map("pred_type")
+  latencyMs    Int?     @map("latency_ms")
+  featuresJson Json     @map("features_json")
+  yPredNum     Float?   @map("y_pred_num")
+  yPredText    String?  @map("y_pred_text")
+  segmentJson  Json     @map("segment_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  labels LabelEvent[]
+
+  @@index([ts])
+  @@index([modelId, modelVersion, ts])
+  @@map("inference_events")
+}
+
+model LabelEvent {
+  id          BigInt   @id @default(autoincrement())
+  ts          DateTime
+  requestId   String   @unique @map("request_id")
+  yTrueNum    Float?   @map("y_true_num")
+  yTrueText   String?  @map("y_true_text")
+  labelType   String   @default("regression") @map("label_type")
+  extraJson   Json     @map("extra_json")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  inference InferenceEvent @relation(fields: [requestId], references: [requestId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([ts])
+  @@map("label_events")
 }

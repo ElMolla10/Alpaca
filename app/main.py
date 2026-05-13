@@ -22,6 +22,16 @@ from ta.volatility import BollingerBands
 from alpaca_trade_api.rest import REST, TimeFrame
 from dotenv import load_dotenv
 
+# Load .env variables early (explicit path, works in all launch modes)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]   # .../Alpaca
+DOTENV_PATH = pathlib.Path(os.environ.get("DOTENV_PATH", str(REPO_ROOT / ".env"))).expanduser()
+
+if DOTENV_PATH.exists():
+    load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+else:
+    load_dotenv(override=True)
+
+
 
 # Load .env variables early
 load_dotenv()
@@ -29,6 +39,7 @@ load_dotenv()
 # === Agentic RL layer ===
 from app.agent.arl_agent import ARLAgent, UserStyle, default_style, BlockContext, Decision
 from app.execution import BlockLedger
+from app.news_sentiment import fetch_news_scores
 
 # === DriftWatch ===
 from app.driftwatch_client import DriftWatchClient
@@ -68,8 +79,8 @@ ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex")  # 'iex' for free; 
 TZ_NY = pytz.timezone("America/New_York")
 
 BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-KEY_ID   = os.environ["APCA_API_KEY_ID"]
-SECRET   = os.environ["APCA_API_SECRET_KEY"]
+KEY_ID   = os.environ.get("APCA_API_KEY_ID")
+SECRET   = os.environ.get("APCA_API_SECRET_KEY")
 
 # Market session
 SESSION_START_H = int(os.environ.get("SESSION_START_H", "10"))   # 10 ET
@@ -116,6 +127,12 @@ THROTTLE_SIZE_MULT   = float(os.environ.get("THROTTLE_SIZE_MULT", "0.70"))  # sc
 AGENTIC_MODE      = os.environ.get("AGENTIC_MODE", "1") == "1"
 USER_STYLE        = os.environ.get("USER_STYLE", "high_risk_short_term")
 AGENT_MAX_SYMBOLS = int(os.environ.get("AGENT_MAX_SYMBOLS", "20"))
+
+# News sentiment
+SENTIMENT_ENABLED          = os.environ.get("SENTIMENT_ENABLED", "1") == "1"
+SENTIMENT_WEIGHT           = float(os.environ.get("SENTIMENT_WEIGHT", "0.3"))
+SENTIMENT_LOOKBACK_OPEN    = int(os.environ.get("SENTIMENT_LOOKBACK_OPEN", "480"))
+SENTIMENT_LOOKBACK_INTRADAY = int(os.environ.get("SENTIMENT_LOOKBACK_INTRADAY", "60"))
 
 # Trading costs (BPS)
 TRADE_COST_BPS = float(os.environ.get("TRADE_COST_BPS", "8.0"))
@@ -168,6 +185,128 @@ def rfc3339(dtobj: datetime) -> str:
 
 def utc_ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 def now_ny():  return dt.datetime.now(TZ_NY)
+
+def get_market_session(api, now_et: dt.datetime | None = None) -> dict:
+    """
+    Session timing without /v2/clock.
+    Primary: Alpaca calendar (/v2/calendar via api.get_calendar()).
+    Fallback: Mon–Fri 09:30–16:00 ET (ignores holidays/early closes).
+    """
+    now_et = now_et or now_ny()
+    today = now_et.date()
+    end_day = today + timedelta(days=10)
+
+    def _parse_date(x):
+        if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
+            return x
+        return dt.datetime.strptime(str(x).strip(), "%Y-%m-%d").date()
+
+    def _parse_hhmm(x):
+        s = str(x).strip()
+        for fmt in ("%H:%M", "%H:%M:%S"):
+            try:
+                return dt.datetime.strptime(s, fmt).time()
+            except Exception:
+                pass
+        return None
+
+    def _mk_et(date_: dt.date, t_: dt.time) -> dt.datetime:
+        return TZ_NY.localize(dt.datetime.combine(date_, t_))
+
+    def _next_weekday(d: dt.date) -> dt.date:
+        while d.weekday() >= 5:
+            d = d + timedelta(days=1)
+        return d
+
+    def _weekday_fallback(next_from: dt.date, source: str) -> dict:
+        d = _next_weekday(next_from)
+        market_open  = _mk_et(d, dt.time(9, 30))
+        market_close = _mk_et(d, dt.time(16, 0))
+        session_open  = _mk_et(d, dt.time(SESSION_START_H, 0))
+        session_close = market_close
+
+        is_open = (d == today) and (session_open <= now_et < session_close)
+
+        if is_open:
+            next_open = None
+        else:
+            if d == today and now_et < session_open:
+                next_open = session_open
+            elif d == today and now_et >= session_close:
+                nd = _next_weekday(today + timedelta(days=1))
+                next_open = _mk_et(nd, dt.time(SESSION_START_H, 0))
+            else:
+                next_open = session_open
+
+        return {
+            "source": source,
+            "market_day": d,
+            "market_open": market_open,
+            "market_close": market_close,
+            "session_open": session_open,
+            "session_close": session_close,
+            "next_open": next_open,
+            "is_open": is_open,
+        }
+
+    try:
+        cal_days = api.get_calendar(start=today.isoformat(), end=end_day.isoformat())
+        source = "alpaca_calendar"
+    except Exception as e:
+        return _weekday_fallback(today, f"fallback_weekday:{e.__class__.__name__}")
+
+    if not cal_days:
+        return _weekday_fallback(today, "fallback_weekday:empty_calendar")
+
+    norm = []
+    for day in cal_days:
+        try:
+            d = _parse_date(getattr(day, "date", None))
+            if today <= d <= end_day:
+                norm.append((d, day))
+        except Exception:
+            continue
+    norm.sort(key=lambda x: x[0])
+
+    if not norm:
+        return _weekday_fallback(today, "fallback_weekday:no_days_in_range")
+
+    chosen = None
+    for d, day in norm:
+        open_t = _parse_hhmm(getattr(day, "open", None))
+        close_t = _parse_hhmm(getattr(day, "close", None))
+        if open_t is None or close_t is None:
+            continue
+
+        market_open  = _mk_et(d, open_t)
+        market_close = _mk_et(d, close_t)
+        session_open  = max(market_open, _mk_et(d, dt.time(SESSION_START_H, 0)))
+        session_close = market_close
+
+        if d == today and now_et >= session_close:
+            continue
+
+        chosen = (d, market_open, market_close, session_open, session_close)
+        break
+
+    if chosen is None:
+        return _weekday_fallback(today + timedelta(days=1), "fallback_weekday:post_close")
+
+    d, market_open, market_close, session_open, session_close = chosen
+    is_open = (d == today) and (session_open <= now_et < session_close)
+    next_open = None if is_open else session_open
+
+    return {
+        "source": source,
+        "market_day": d,
+        "market_open": market_open,
+        "market_close": market_close,
+        "session_open": session_open,
+        "session_close": session_close,
+        "next_open": next_open,
+        "is_open": is_open,
+    }
+
 
 def is_friday_ny() -> tuple[bool, int]:
     n = now_ny()
@@ -747,6 +886,7 @@ def run_session(api):
         block_start   = t_now if t_now >= session_open else session_open
 
         b = 0
+        block_index = 0
         while True:
             # 1) EOD check
             mins_to_close_now = (session_close - now_ny()).total_seconds() / 60.0
@@ -822,6 +962,13 @@ def run_session(api):
 
             price_cache = {}
 
+            if SENTIMENT_ENABLED:
+                sentiment_lookback = SENTIMENT_LOOKBACK_OPEN if block_index == 0 else SENTIMENT_LOOKBACK_INTRADAY
+                print(f"[NEWS] lookback={sentiment_lookback}min (block {block_index})")
+                news_scores = fetch_news_scores(list(trade_universe), api, sentiment_lookback)
+            else:
+                news_scores = {}
+
             for sym in SYMBOLS:
                 try:
                     minutes_to_close = (session_close - now_ny()).total_seconds() / 60.0
@@ -862,6 +1009,13 @@ def run_session(api):
                     sig = predict_block_signal(api, sym, df_override=df_feat)
                     pred = sig["pred_pct"] * SIGN_MULT
                     latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
+
+                    if SENTIMENT_ENABLED:
+                        ns = news_scores.get(sym, 0.0)
+                        if ns != 0.0:
+                            pred_before = pred
+                            pred = pred * (1.0 + SENTIMENT_WEIGHT * ns * math.copysign(1.0, pred))
+                            print(f"[NEWS] {sym}: score={ns:+.3f} pred {pred_before:.4f}% → {pred:.4f}%")
 
                     if pred == 0.0:
                         print(f"[WARN] {sym}: prediction is 0.0 (check features/models)")
@@ -1019,6 +1173,7 @@ def run_session(api):
 
             dw.flush()
             block_start = block_end
+            block_index += 1
 
     finally:
         dw.close()

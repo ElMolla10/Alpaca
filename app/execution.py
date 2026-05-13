@@ -48,13 +48,17 @@ class BlockLedger:
 
         buy_notional  = sum(f.qty * f.price for f in fills if f.side == "buy")
         sell_notional = sum(f.qty * f.price for f in fills if f.side == "sell")
+        fees_abs = sum(f.fees_abs for f in fills)
 
         # Exposure basis: pick a stable denominator based on first fill side (supports shorts)
         first_side = fills[0].side
         gross_exposed = buy_notional if first_side == "buy" else sell_notional
 
+        if buy_notional <= 0 or sell_notional <= 0:
+            return 0.0 if gross_exposed <= 0 else (-fees_abs / gross_exposed) * 100.0
+
         pnl_abs = sell_notional - buy_notional
-        pnl_abs -= sum(f.fees_abs for f in fills)
+        pnl_abs -= fees_abs
 
         return 0.0 if gross_exposed <= 0 else (pnl_abs / gross_exposed) * 100.0
 
