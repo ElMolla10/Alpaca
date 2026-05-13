@@ -51,8 +51,9 @@ PROJECT_SPEC: Dict[str, Any] = {
     "headline": "End-to-end agentic electronic trading engine",
     "thesis": (
         "Alpaca separates prediction, online modulation, position sizing, and hard risk constraints. "
-        "The website mirrors the report: requirements, architecture, agent behavior, guardrails, "
-        "observability, validation, and future work."
+        "The local Python Project Command Center with integrated DriftWatch observability mirrors the report: "
+        "project overview, trading/account status, architecture, ARLAgent behavior, guardrails, "
+        "inference and label observability, validation, configuration, and future work."
     ),
     "architecture": [
         {
@@ -249,7 +250,6 @@ def repo_snapshot() -> Dict[str, Any]:
             "app/driftwatch_client.py",
             "app/driftwatch_dashboard.py",
             "README.md",
-            "app/README.md",
             "schema/driftwatch.sql",
             "tests/",
         ],
