@@ -1,3 +1,0 @@
--- Migration script for PlanetScale
--- Run this to initialize the database tables
--- This will be executed via npx prisma migrate deploy

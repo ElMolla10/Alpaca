@@ -1,135 +1,63 @@
-# 🧠 Agentic E-Trading Bot
+# Alpaca
 
-A modular, adaptive trading engine built on **Reinforcement Learning (RL)**, contextual decision logic, and predictive modeling.  
-The system learns from trading performance, adjusts behavior based on reward feedback, and executes trades with strict risk and safety constraints.
+Python agentic trading system with a local DriftWatch Project Command Center.
 
----
+## What This Repo Runs
 
-## 📁 Project Structure
+- `app/main.py` - the Alpaca paper-trading engine.
+- `app/driftwatch_client.py` - writes inference and label events to PostgreSQL.
+- `app/driftwatch_dashboard.py` - the local Python command center for trading status, DriftWatch observability, architecture, risk, validation, config, and roadmap.
+- `schema/driftwatch.sql` - the PostgreSQL schema for DriftWatch tables.
 
-```
-app/
- ├── agent/
- │    ├── __init__.py
- │    └── arl_agent.py          # Core RL logic, state updates, and policy methods
- │
- ├── model/
- │    ├── __init__.py
- │    └── XGboost_model.json    # Predictive model used for directional bias
- │
- ├── execution.py               # Order execution, fills, slippage, and PnL ledger
- ├── feat_cols.json             # List of engineered features used by the model
- ├── main.py                    # Main loop orchestrating data → decision → execution
- │
- ├── render.yaml                # Cloud deployment configuration
- ├── requirements.txt           # Python dependencies
- ├── runtime.txt                # Python runtime version
- └── README.md
-```
+The project now presents one dashboard story: the local Python command center.
 
----
+## Run The Engine
 
-## ⚙️ Core Components
-
-### 🔹 1. RL Agent (`arl_agent.py`)
-The RL agent is responsible for:
-
-- Learning from **net PnL% per block**
-- Adjusting **position size, timing, and hold duration**
-- Reacting to performance and volatility changes
-- Resetting daily to prevent leakage
-- Shaping its behavior using the `UserStyle` dataclass:
-  - Momentum or mean-reversion preference  
-  - Risk levels (low / medium / high)
-
----
-
-### 🔹 2. Execution Layer (`execution.py`)
-Handles the trading pipeline:
-
-- Idempotent order placement (safe retries)
-- Partial-fill detection and correction
-- Slippage + fee modeling
-- Block-based ledger tracking:
-  - Realized PnL  
-  - Unrealized PnL  
-  - Exposure  
-  - Transaction cost impact  
-
----
-
-### 🔹 3. Predictive Model (`model/XGboost_model.json`)
-Provides directional bias for the RL agent:
-
-- Encodes OHLCV patterns, volatility, and trend signals  
-- Serves as a **non-deterministic hint**, not a hard decision  
-- Supports hybrid learning (model signal + RL adjustment)
-
----
-
-## 📊 Key Features
-
-- Adaptive RL policy updated every trading block  
-- Context-aware sizing and entry timing  
-- Realistic execution via slippage + fee modeling  
-- Daily state resets  
-- Deterministic reward loops  
-- Easy integration with other agents (sentiment, macro, LSTM, etc.)
-
----
-
-## 🧠 Reward Function
-
-\[
-Reward = \frac{PnL - (Fees + Slippage)}{Exposure}
-\]
-
-Rewards are directly tied to profitability and risk efficiency.
-
----
-
-## 🚀 Running the System
-
-### 1️⃣ Install dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 2️⃣ Run the engine
 ```bash
 python -m app.main
 ```
 
-Ensure you're running from the project root so module imports resolve correctly.
+The engine uses Alpaca paper trading and writes DriftWatch events to PostgreSQL.
 
----
+## Run The Command Center
 
-## 🧩 Configuration (UserStyle)
+```bash
+python -m app.driftwatch_dashboard --host 127.0.0.1 --port 8765
+```
 
-| Parameter | Description | Example |
-|----------|-------------|---------|
-| `max_symbols` | Max symbols to trade | 8 |
-| `prefer_momentum` | Trend-following bias | True |
-| `risk_level` | User risk mode | "high" |
-| `base_size_mult` | Base sizing | 1.0 |
-| `base_hold_min_blocks` | Minimum holding time | 2 |
+Then open:
 
----
+```text
+http://127.0.0.1:8765
+```
 
-## 🛡️ QA & Safety
+This command center is intended for local or demo use only. Do not expose it publicly without authentication.
 
-- Detects missing or stale data  
-- Ensures feature completeness (no leakage)  
-- Prevents accidental duplicate orders  
-- Tracks success rate and exposure consistency  
-- Validates environment before each execution loop  
+## Environment
 
----
+The main runtime expects these secrets in `.env`:
 
-## 👥 Contributors
+- `APCA_API_KEY_ID`
+- `APCA_API_SECRET_KEY`
+- `APCA_API_BASE_URL`
+- `DRIFTWATCH_DATABASE_URL`
 
-- Mohamed Ehab  
-- Abdelrahman Tamer  
-- Mohamed Atef  
-- Moataz Kamal  
-- Yahia Abdelmonaem  
+## Repository Layout
+
+```text
+app/
+  agent/               ARL agent implementation
+  execution.py         order execution and PnL ledger
+  driftwatch_client.py DriftWatch persistence client
+  driftwatch_dashboard.py local command center
+  main.py              trading engine entry point
+schema/
+  driftwatch.sql        DriftWatch PostgreSQL schema
+tests/                 pytest coverage for engine and dashboard
+```
+
+## Notes
+
+- Trading executes against Alpaca paper trading.
+- DriftWatch stores inference and label events in PostgreSQL.
+- The command center reads live local data and should stay behind local access or auth.

@@ -248,7 +248,8 @@ def repo_snapshot() -> Dict[str, Any]:
             "app/execution.py",
             "app/driftwatch_client.py",
             "app/driftwatch_dashboard.py",
-            "Website/prisma/schema.prisma",
+            "README.md",
+            "app/README.md",
             "schema/driftwatch.sql",
             "tests/",
         ],
@@ -639,6 +640,7 @@ HTML = r"""<!doctype html>
     .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
     .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .wide-right { grid-template-columns: minmax(0, .78fr) minmax(0, 1.22fr); }
+    .trading-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .card {
       border: 1px solid rgba(98,183,255,.18);
       background: linear-gradient(180deg, rgba(12,22,41,.95), rgba(6,12,23,.96));
@@ -650,6 +652,23 @@ HTML = r"""<!doctype html>
     .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
     .value { margin-top: 11px; font-size: 31px; font-weight: 780; letter-spacing: 0; }
     .meta { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .trading-metrics .metric {
+      min-height: 104px;
+      padding: 15px 16px;
+    }
+    .trading-metrics .value {
+      font-size: clamp(22px, 1.8vw, 27px);
+      line-height: 1.05;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      font-variant-numeric: tabular-nums;
+    }
+    .trading-metrics .meta {
+      overflow-wrap: anywhere;
+    }
+    #equityChart {
+      height: 360px;
+    }
     .good { color: var(--good); }
     .bad { color: var(--danger); }
     .warn { color: var(--warn); }
@@ -720,6 +739,8 @@ HTML = r"""<!doctype html>
     @media (max-width: 980px) {
       .shell { padding: 16px; }
       .hero, .metrics, .two, .three, .wide-right, .mini-grid { grid-template-columns: 1fr; }
+      .trading-metrics { grid-template-columns: 1fr; }
+      #equityChart { height: 260px; }
       canvas { height: 240px; }
       h1 { font-size: 42px; }
     }
@@ -761,7 +782,7 @@ HTML = r"""<!doctype html>
       <div class="card">
         <div class="section-head"><h2>Trading Account</h2><span id="tradingMode">loading</span></div>
         <div class="body">
-          <div class="grid metrics" id="tradingMetrics" style="margin-top:0"></div>
+          <div class="grid trading-metrics" id="tradingMetrics" style="margin-top:0"></div>
         </div>
       </div>
       <div class="card">
